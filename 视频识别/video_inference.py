@@ -2,11 +2,9 @@
 """Run image-checkpoint inference over laryngeal videos.
 
 The script treats a video as a bag of sampled frames. It does not train a
-temporal model. The standard pipeline applies quality filtering, binary glottis
-gating, and YOLO-Pose+DINOv3 ROI acceptance before aggregating 8-class disease
-probabilities over accepted ROI crops. If strict ROI accepts no frame in a
-video, the pipeline falls back to full-frame Swin inference for frames that
-passed the upstream quality and glottis gates.
+temporal model. The standard pipeline applies quality, ROI validity/reflection,
+and binary glottis gates before aggregating 8-class disease probabilities over
+the surviving frames.
 """
 
 from __future__ import annotations
@@ -14,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -107,30 +106,60 @@ DEFAULT_GLOTTIS_GATE_MODEL = Path(
         ),
     )
 )
-DEFAULT_YOLO_POSE_ROI_MODEL = Path(
+DEFAULT_ROI_LOCALIZER_MODEL = Path(
     os.environ.get(
         "LARYNX_ROI_LOCALIZER_MODEL",
-        "/home/or1ngelinux/CVProjects/Larynx/YOLOPoseVocalFold/Results/"
-        "dinov3_aux_full_pipeline_v12_20260524/stage1_pose/"
-        "yolo11m_stage1_manual_mixedneg60_blackpad_containment_l0p05_v12/"
-        "weights/best.pt",
+        str(
+            _first_existing_path(
+                Path(RESULTS_DIR)
+                / "roi_reflection"
+                / "localizer_transformer_20260507_111744"
+                / "roi_localizer_best.pth",
+                Path(RESULTS_ROOT)
+                / "bagls_roi_reflection"
+                / "roi_reflection"
+                / "localizer_transformer_20260507_111744"
+                / "roi_localizer_best.pth",
+                Path(RESULTS_DIR) / "roi_reflection" / "localizer" / "roi_localizer_best.pth",
+                Path(RESULTS_DIR) / "roi_reflection" / "localizer_full" / "roi_localizer_best.pth",
+                Path(RESULTS_ROOT)
+                / "bagls_roi_reflection"
+                / "roi_reflection"
+                / "localizer_full"
+                / "roi_localizer_best.pth",
+                Path(RESULTS_DIR) / "roi_reflection" / "roi_localizer_best.pth",
+            )
+        ),
     )
 )
-DEFAULT_DINO_AUX_ROI_MODEL = Path(
+DEFAULT_ROI_REFLECTION_MODEL = Path(
     os.environ.get(
-        "LARYNX_ROI_DINO_AUX_MODEL",
-        "/home/or1ngelinux/CVProjects/Larynx/YOLOPoseVocalFold/Results/"
-        "dinov3_keypoint_aux/"
-        "dinov3_vits16_oriented_point_region_hardneg_448_ldp200_v12_20260524/"
-        "weights/best_aux_head.pt",
+        "LARYNX_ROI_REFLECTION_MODEL",
+        str(
+            _first_existing_path(
+                Path(RESULTS_DIR)
+                / "roi_reflection"
+                / "reflection_full_corrected"
+                / "roi_reflection_best.pth",
+                Path(RESULTS_ROOT)
+                / "bagls_roi_reflection"
+                / "roi_reflection"
+                / "reflection_full_corrected"
+                / "roi_reflection_best.pth",
+                Path(RESULTS_DIR) / "roi_reflection" / "reflection_gate" / "roi_reflection_best.pth",
+                Path(RESULTS_DIR) / "roi_reflection" / "reflection_full" / "roi_reflection_best.pth",
+                Path(RESULTS_ROOT)
+                / "bagls_roi_reflection"
+                / "roi_reflection"
+                / "reflection_full"
+                / "roi_reflection_best.pth",
+                Path(RESULTS_DIR) / "roi_reflection" / "roi_reflection_best.pth",
+            )
+        ),
     )
 )
-DEFAULT_DINO_AUX_CODE_ROOT = Path(
-    os.environ.get(
-        "LARYNX_ROI_DINO_AUX_CODE_ROOT",
-        "/home/or1ngelinux/CVProjects/Larynx/YOLOPoseVocalFold",
-    )
-)
+ROI_REFLECTION_DIR = PROJECT_ROOT / "roi_reflection"
+ROI_COMMON_PATH = ROI_REFLECTION_DIR / "common.py"
 
 DEFAULT_FOLDER_LABEL_MAP = {
     "normal/healthy-larynx": "Normal",
@@ -169,24 +198,15 @@ class VideoItem:
 
 
 @dataclass
-class DinoAuxBundle:
-    checkpoint_path: Path
-    code_root: Path
-    device: torch.device
-    imgsz: int
-    extractor: Any
-    head: Any
-    aux_cfg: Any
-    prediction_input_cls: Any
-    attach_aux_score: Any
-
-
-@dataclass
 class RoiGateBundle:
-    model: Any
-    weights_path: Path
-    device_arg: str | None
-    aux: DinoAuxBundle | None = None
+    common: Any
+    localizer_model: torch.nn.Module
+    reflection_model: torch.nn.Module
+    localizer_cfg: dict[str, Any]
+    reflection_cfg: dict[str, Any]
+    localizer_checkpoint: dict[str, Any]
+    reflection_checkpoint: dict[str, Any]
+    device: torch.device
 
 
 STANDARD_VARIANT = "standard_roi_glottis_top_fraction"
@@ -338,108 +358,54 @@ def parse_args() -> argparse.Namespace:
         "--glottis-gate",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable the binary glottis gate before ROI and 8-class inference.",
+        help="Enable the binary glottis gate before the 8-class classifier.",
     )
     parser.add_argument(
         "--roi-gate",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable YOLO-Pose+DINOv3 ROI acceptance and square crop preprocessing.",
+        help="Enable ROI validity/reflection gate after quality filtering and before the glottis gate.",
     )
     parser.add_argument(
         "--roi-localizer-model",
         type=Path,
-        default=DEFAULT_YOLO_POSE_ROI_MODEL,
-        help="YOLO-Pose glottic ROI checkpoint used to crop every frame before classification.",
+        default=DEFAULT_ROI_LOCALIZER_MODEL,
+        help="ROI localizer checkpoint from 图像识别/roi_reflection/.",
+    )
+    parser.add_argument(
+        "--roi-reflection-model",
+        type=Path,
+        default=DEFAULT_ROI_REFLECTION_MODEL,
+        help="ROI reflection classifier checkpoint from 图像识别/roi_reflection/.",
     )
     parser.add_argument(
         "--roi-valid-threshold",
         type=float,
-        default=0.25,
-        help="Minimum YOLO ROI bbox confidence used before DINOv3 auxiliary scoring.",
+        default=0.55,
+        help="Keep ROI-localizer-valid frames at or above this probability.",
     )
     parser.add_argument(
-        "--roi-accept-threshold",
+        "--roi-reflect-threshold",
         type=float,
-        default=0.25,
-        help="Minimum combined YOLO/DINO ROI confidence required to keep a frame for Swin inference.",
+        default=0.65,
+        help="Mark frames at or above this reflection probability as mild reflection.",
     )
     parser.add_argument(
-        "--roi-dino-aux-model",
-        type=Path,
-        default=DEFAULT_DINO_AUX_ROI_MODEL,
-        help="DINOv3 auxiliary point-region checkpoint used together with the YOLO-Pose ROI localizer.",
-    )
-    parser.add_argument(
-        "--roi-dino-aux-code-root",
-        type=Path,
-        default=DEFAULT_DINO_AUX_CODE_ROOT,
-        help="Checkout containing the DINOv3 auxiliary scoring code.",
-    )
-    parser.add_argument(
-        "--roi-dino-aux",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable the DINOv3 auxiliary ROI scorer after YOLO-Pose produces candidate keypoints.",
-    )
-    parser.add_argument(
-        "--roi-dino-aux-accept-threshold",
+        "--roi-severe-reflect-threshold",
         type=float,
-        default=0.30,
-        help="Minimum DINOv3 point-region score required to accept a YOLO ROI crop.",
-    )
-    parser.add_argument(
-        "--roi-dino-aux-imgsz",
-        type=int,
-        default=None,
-        help="Override DINOv3 auxiliary input size; defaults to the checkpoint config.",
-    )
-    parser.add_argument(
-        "--roi-dino-aux-device",
-        choices=["auto", "cuda", "cpu"],
-        default="auto",
-        help="Device for DINOv3 auxiliary ROI scoring. auto reuses the main inference device.",
-    )
-    parser.add_argument(
-        "--roi-black-border-luma-floor",
-        type=float,
-        default=8.0,
-        help="Brightness floor for removing existing black borders before YOLO-Pose/DINO ROI scoring.",
-    )
-    parser.add_argument(
-        "--roi-imgsz",
-        type=int,
-        default=960,
-        help="YOLO-Pose inference image size.",
-    )
-    parser.add_argument(
-        "--roi-blackpad-fraction",
-        type=float,
-        default=0.30,
-        help="Black border fraction added to each side before YOLO-Pose ROI localization.",
-    )
-    parser.add_argument(
-        "--roi-blackpad-min-padding",
-        type=int,
-        default=80,
-        help="Minimum black border pixels added before YOLO-Pose ROI localization.",
+        default=0.85,
+        help="Filter frames at or above this reflection probability.",
     )
     parser.add_argument(
         "--roi-cache-device",
         choices=["auto", "cuda", "cpu"],
         default="auto",
-        help="Device for YOLO-Pose ROI inference. auto reuses the main inference device.",
+        help="Device for ROI sidecar inference. auto reuses the main inference device.",
     )
     parser.add_argument(
         "--roi-allow-missing-model",
         action="store_true",
-        help="Use full-frame square fallback if the YOLO-Pose ROI model is missing; otherwise missing files are errors.",
-    )
-    parser.add_argument(
-        "--roi-video-fallback",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="If strict ROI accepts no frame in a video, infer on upstream quality+glottis full frames.",
+        help="Keep upstream-eligible frames if ROI module/checkpoints are missing; otherwise missing files are errors.",
     )
     parser.add_argument(
         "--gradcam",
@@ -745,114 +711,244 @@ def resolve_roi_device(value: str, main_device: torch.device) -> torch.device:
     raise ValueError(f"Unknown ROI cache device: {value}")
 
 
+def import_roi_common() -> Any:
+    if not ROI_COMMON_PATH.exists():
+        raise FileNotFoundError(
+            f"ROI gate module not found: {ROI_COMMON_PATH}. "
+            "Pass --no-roi-gate to disable it or add 图像识别/roi_reflection/common.py."
+        )
+    spec = importlib.util.spec_from_file_location("larynx_roi_reflection_common", ROI_COMMON_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to import ROI gate module from {ROI_COMMON_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _invoke_checkpoint_loader(fn, model_path: Path, device: torch.device, role: str):
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(model_path, device)
+
+    kwargs = {}
+    has_var_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+    )
+    for name in signature.parameters:
+        if name in {"model_path", "checkpoint_path", "path"}:
+            kwargs[name] = model_path
+        elif name == "device":
+            kwargs[name] = device
+        elif name in {"role", "task", "model_role"}:
+            kwargs[name] = role
+    if has_var_kwargs:
+        kwargs.setdefault("model_path", model_path)
+        kwargs.setdefault("device", device)
+    if kwargs:
+        return fn(**kwargs)
+    return fn(model_path, device)
+
+
+def _unpack_loaded_model(result, device: torch.device, role: str):
+    cfg: dict[str, Any] = {}
+    checkpoint: dict[str, Any] = {}
+
+    if isinstance(result, dict) and "model" in result:
+        model = result["model"]
+        if isinstance(result.get("cfg"), dict):
+            cfg.update(result["cfg"])
+        checkpoint.update({k: v for k, v in result.items() if k != "model"})
+    elif isinstance(result, tuple):
+        if not result:
+            raise TypeError(f"ROI {role} loader returned an empty tuple.")
+        model = result[0]
+        for part in result[1:]:
+            if not isinstance(part, dict):
+                continue
+            if isinstance(part.get("cfg"), dict):
+                cfg.update(part["cfg"])
+                checkpoint.update(part)
+            elif any(key in part for key in ("state_dict", "model_state_dict", "epoch", "recommended_threshold")):
+                checkpoint.update(part)
+            else:
+                cfg.update(part)
+    else:
+        model = result
+
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError(f"ROI {role} loader must return a torch.nn.Module, got {type(model)!r}.")
+    model.to(device)
+    model.eval()
+    return model, cfg, checkpoint
+
+
+def _load_roi_model_from_common(
+    common: Any,
+    names: tuple[str, ...],
+    model_path: Path,
+    device: torch.device,
+    role: str,
+):
+    for name in names:
+        fn = getattr(common, name, None)
+        if fn is None:
+            continue
+        result = _invoke_checkpoint_loader(fn, model_path, device, role)
+        return _unpack_loaded_model(result, device, role)
+    raise AttributeError(
+        f"{ROI_COMMON_PATH} must expose one of {', '.join(names)} for ROI {role} loading."
+    )
+
+
 def resolve_checkpoint_path(path: Path, role: str) -> Path:
     path = Path(path).expanduser()
     if not path.exists():
         raise FileNotFoundError(
             f"ROI {role} checkpoint not found: {path}. "
-            "Pass --no-roi-gate to disable ROI cropping or set --roi-localizer-model."
+            "Pass --no-roi-gate to disable ROI gate or set the matching --roi-*-model path."
         )
     return path.resolve()
 
 
-def resolve_aux_code_root(path: Path) -> Path:
-    path = Path(path).expanduser().resolve()
-    module_path = path / "tools" / "score_predictions_with_dinov3_aux.py"
-    if not module_path.exists():
-        raise FileNotFoundError(
-            f"DINOv3 auxiliary ROI code not found: {module_path}. "
-            "Set --roi-dino-aux-code-root or pass --no-roi-dino-aux."
-        )
-    return path
-
-
-def yolo_device_arg(device: torch.device) -> str:
-    if device.type == "cpu":
-        return "cpu"
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return str(index)
-
-
-def import_dino_aux_module(code_root: Path) -> Any:
-    module_name = "_larynx_roi_dinov3_aux_score"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    if str(code_root) not in sys.path:
-        sys.path.insert(0, str(code_root))
-    module_path = code_root / "tools" / "score_predictions_with_dinov3_aux.py"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load DINOv3 auxiliary scorer from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def build_dino_aux_bundle(args: argparse.Namespace, main_device: torch.device) -> DinoAuxBundle:
-    aux_path = resolve_checkpoint_path(args.roi_dino_aux_model, "DINOv3 auxiliary")
-    code_root = resolve_aux_code_root(args.roi_dino_aux_code_root)
-    aux_device = resolve_roi_device(args.roi_dino_aux_device, main_device)
-    score_module = import_dino_aux_module(code_root)
-    checkpoint = torch.load(aux_path, map_location="cpu")
-    aux_cfg = score_module.load_aux_config_from_checkpoint(checkpoint)
-    imgsz = int(args.roi_dino_aux_imgsz or checkpoint.get("config", {}).get("imgsz", 448))
-    args.roi_dino_aux_imgsz = imgsz
-    extractor = score_module.load_dinov3_extractor(aux_cfg, aux_device)
-    for parameter in extractor.parameters():
-        parameter.requires_grad_(False)
-    head = score_module.DinoV3KeypointAuxHead(
-        int(checkpoint["feature_dim"]),
-        patch_output_size=aux_cfg.oriented_patch_output_size,
-        point_hidden_dim=aux_cfg.point_hidden_dim,
-        include_coordinates=aux_cfg.include_point_coordinates,
-        include_valid_mask=aux_cfg.include_valid_mask,
-    ).to(aux_device)
-    head.load_state_dict(checkpoint["head"])
-    head.eval()
-    return DinoAuxBundle(
-        checkpoint_path=aux_path,
-        code_root=code_root,
-        device=aux_device,
-        imgsz=imgsz,
-        extractor=extractor,
-        head=head,
-        aux_cfg=aux_cfg,
-        prediction_input_cls=score_module.DinoV3PredictionInput,
-        attach_aux_score=score_module.attach_aux_score,
-    )
-
-
 def build_roi_gate_bundle(args: argparse.Namespace, main_device: torch.device) -> RoiGateBundle | None:
     try:
+        common = import_roi_common()
         roi_device = resolve_roi_device(args.roi_cache_device, main_device)
-        weights_path = resolve_checkpoint_path(args.roi_localizer_model, "YOLO-Pose localizer")
+        localizer_path = resolve_checkpoint_path(args.roi_localizer_model, "localizer")
+        reflection_path = resolve_checkpoint_path(args.roi_reflection_model, "reflection")
     except FileNotFoundError as exc:
         if args.roi_allow_missing_model:
-            print(f"WARNING: ROI localizer unavailable: {exc}. Using full-frame square fallback.")
+            print(f"WARNING: ROI gate requested but unavailable: {exc}. Keeping upstream-eligible frames.")
             return None
         raise
 
-    try:
-        from ultralytics import YOLO
-    except ImportError as exc:
-        raise RuntimeError(
-            "ultralytics is required for YOLO-Pose ROI localization. "
-            "Install it or pass --no-roi-gate to bypass ROI cropping."
-        ) from exc
-    try:
-        aux_bundle = build_dino_aux_bundle(args, main_device) if args.roi_dino_aux else None
-    except FileNotFoundError as exc:
-        if args.roi_allow_missing_model:
-            print(f"WARNING: ROI auxiliary scorer unavailable: {exc}. Using full-frame square fallback.")
-            return None
-        raise
-    return RoiGateBundle(
-        model=YOLO(str(weights_path)),
-        weights_path=weights_path,
-        device_arg=yolo_device_arg(roi_device),
-        aux=aux_bundle,
+    localizer_model, localizer_cfg, localizer_checkpoint = _load_roi_model_from_common(
+        common,
+        (
+            "load_roi_localizer_model",
+            "load_localizer_model",
+            "load_localizer_checkpoint",
+            "load_roi_localizer",
+            "load_checkpoint_localizer",
+        ),
+        localizer_path,
+        roi_device,
+        "localizer",
     )
+    reflection_model, reflection_cfg, reflection_checkpoint = _load_roi_model_from_common(
+        common,
+        (
+            "load_roi_reflection_model",
+            "load_reflection_model",
+            "load_reflection_checkpoint",
+            "load_roi_reflection_classifier",
+            "load_checkpoint_reflection",
+        ),
+        reflection_path,
+        roi_device,
+        "reflection",
+    )
+    return RoiGateBundle(
+        common=common,
+        localizer_model=localizer_model,
+        reflection_model=reflection_model,
+        localizer_cfg=localizer_cfg,
+        reflection_cfg=reflection_cfg,
+        localizer_checkpoint=localizer_checkpoint,
+        reflection_checkpoint=reflection_checkpoint,
+        device=roi_device,
+    )
+
+
+def _call_image_helper(fn, rgb: np.ndarray, cfg: dict[str, Any]):
+    image = Image.fromarray(rgb).convert("RGB")
+    attempts = ((rgb, cfg), (image, cfg), (rgb,), (image,))
+    last_exc: TypeError | None = None
+    for args in attempts:
+        try:
+            return fn(*args)
+        except TypeError as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise TypeError(f"Unable to call image helper {fn}")
+
+
+def _ensure_chw_float_tensor(value) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        if tensor.dim() == 4 and tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        if tensor.dim() != 3:
+            raise ValueError(f"Expected 3D CHW/HWC tensor from ROI preprocess, got {tuple(tensor.shape)}")
+        if tensor.shape[0] not in {1, 3} and tensor.shape[-1] in {1, 3}:
+            tensor = tensor.permute(2, 0, 1)
+        tensor = tensor.contiguous()
+        if tensor.dtype == torch.uint8:
+            return tensor.float().div(255.0)
+        return tensor.float()
+
+    if isinstance(value, Image.Image):
+        array = np.asarray(value.convert("RGB"), dtype=np.uint8)
+    else:
+        array = np.asarray(value)
+        if array.ndim == 2:
+            array = np.repeat(array[:, :, None], 3, axis=2)
+        if array.shape[0] in {1, 3} and array.ndim == 3:
+            tensor = torch.from_numpy(np.ascontiguousarray(array))
+            if tensor.dtype == torch.uint8:
+                return tensor.float().div(255.0)
+            return tensor.float()
+    if array.ndim != 3:
+        raise ValueError(f"Expected 3D image array from ROI preprocess, got shape {array.shape}")
+    tensor = torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1)))
+    if tensor.dtype == torch.uint8:
+        return tensor.float().div(255.0)
+    return tensor.float()
+
+
+def _fallback_roi_preprocess(rgb: np.ndarray, cfg: dict[str, Any], default_size: int) -> torch.Tensor:
+    image_size = int(cfg.get("image_size", cfg.get("input_size", default_size)))
+    image = Image.fromarray(rgb).convert("RGB").resize((image_size, image_size), Image.BICUBIC)
+    array = np.asarray(image, dtype=np.uint8)
+    return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1))).float().div_(255.0)
+
+
+def _preprocess_roi_rgb(common: Any, rgb: np.ndarray, cfg: dict[str, Any], role: str) -> torch.Tensor:
+    helper_names = (
+        ("preprocess_localizer_frame", "roi_localizer_preprocess", "localizer_preprocess_frame")
+        if role == "localizer"
+        else ("preprocess_reflection_roi", "roi_reflection_preprocess", "reflection_preprocess_frame")
+    )
+    for name in helper_names:
+        fn = getattr(common, name, None)
+        if fn is None:
+            continue
+        return _ensure_chw_float_tensor(_call_image_helper(fn, rgb, cfg))
+    return _fallback_roi_preprocess(rgb, cfg, default_size=256 if role == "localizer" else 224)
+
+
+def _normalise_roi_batch(common: Any, batch: torch.Tensor, role: str) -> torch.Tensor:
+    helper_names = (
+        ("normalise_localizer_batch", "normalize_localizer_batch", "roi_localizer_normalise")
+        if role == "localizer"
+        else ("normalise_reflection_batch", "normalize_reflection_batch", "roi_reflection_normalise")
+    )
+    for name in helper_names:
+        fn = getattr(common, name, None)
+        if fn is None:
+            continue
+        return fn(batch)
+    if batch.numel() and float(batch.detach().amin().cpu()) >= -0.05:
+        return gpu_normalise(batch)
+    return batch
+
+
+def _sigmoid_np(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(values.astype(np.float32), -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
 
 
 def _scale_bbox_xyxy(box: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -870,6 +966,263 @@ def _scale_bbox_xyxy(box: np.ndarray, width: int, height: int) -> np.ndarray:
     return np.array([x1, y1, x2, y2], dtype=np.float32)
 
 
+def _mask_to_bbox(mask: np.ndarray, width: int, height: int) -> tuple[np.ndarray, float]:
+    prob = np.asarray(mask, dtype=np.float32)
+    if prob.ndim == 3:
+        prob = prob.squeeze()
+    if prob.size == 0:
+        return np.full(4, np.nan, dtype=np.float32), float("nan")
+    valid_prob = float(np.nanmax(prob))
+    binary = prob >= 0.5
+    if not binary.any():
+        return np.full(4, np.nan, dtype=np.float32), valid_prob
+    ys, xs = np.where(binary)
+    scale_x = float(width) / float(prob.shape[1])
+    scale_y = float(height) / float(prob.shape[0])
+    box = np.array(
+        [
+            float(xs.min()) * scale_x,
+            float(ys.min()) * scale_y,
+            float(xs.max() + 1) * scale_x,
+            float(ys.max() + 1) * scale_y,
+        ],
+        dtype=np.float32,
+    )
+    return _scale_bbox_xyxy(box, width, height), valid_prob
+
+
+def _coerce_localizer_records(result, rgbs: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray] | None:
+    n = len(rgbs)
+    bboxes = np.full((n, 4), np.nan, dtype=np.float32)
+    valid_probs = np.full(n, np.nan, dtype=np.float32)
+
+    if isinstance(result, dict):
+        bbox_value = (
+            result.get("bbox_xyxy")
+            if "bbox_xyxy" in result
+            else result.get("bboxes_xyxy", result.get("boxes", result.get("bbox")))
+        )
+        valid_value = (
+            result.get("valid_prob")
+            if "valid_prob" in result
+            else result.get("valid_probs", result.get("roi_valid_prob", result.get("prob")))
+        )
+        valid_logit_value = result.get(
+            "valid_logit",
+            result.get("valid_logits", result.get("roi_valid_logit", result.get("roi_valid_logits"))),
+        )
+        if bbox_value is not None:
+            box_array = np.asarray(
+                bbox_value.detach().cpu().numpy() if isinstance(bbox_value, torch.Tensor) else bbox_value,
+                dtype=np.float32,
+            )
+            if box_array.ndim == 1:
+                box_array = box_array[None, :]
+            for i in range(min(n, box_array.shape[0])):
+                h, w = rgbs[i].shape[:2]
+                bboxes[i] = _scale_bbox_xyxy(box_array[i, :4], w, h)
+        if valid_value is not None:
+            valid_array = np.asarray(
+                valid_value.detach().cpu().numpy() if isinstance(valid_value, torch.Tensor) else valid_value,
+                dtype=np.float32,
+            )
+            if valid_array.ndim == 2 and valid_array.shape[1] >= 2:
+                valid_array = valid_array[:, 1]
+            valid_array = valid_array.reshape(-1)
+            if valid_array.size and (float(np.nanmin(valid_array)) < 0.0 or float(np.nanmax(valid_array)) > 1.0):
+                valid_array = _sigmoid_np(valid_array)
+            valid_probs[: min(n, valid_array.size)] = valid_array[:n]
+        elif valid_logit_value is not None:
+            valid_array = np.asarray(
+                (
+                    valid_logit_value.detach().cpu().numpy()
+                    if isinstance(valid_logit_value, torch.Tensor)
+                    else valid_logit_value
+                ),
+                dtype=np.float32,
+            )
+            if valid_array.ndim == 2 and valid_array.shape[1] >= 2:
+                valid_array = valid_array[:, 1]
+            valid_array = _sigmoid_np(valid_array.reshape(-1))
+            valid_probs[: min(n, valid_array.size)] = valid_array[:n]
+        if bbox_value is not None or valid_value is not None or valid_logit_value is not None:
+            return bboxes, valid_probs
+
+    if isinstance(result, list) and (not result or isinstance(result[0], dict)):
+        for i, row in enumerate(result[:n]):
+            if row is None:
+                continue
+            h, w = rgbs[i].shape[:2]
+            bbox = row.get("bbox_xyxy", row.get("bbox", row.get("box")))
+            if bbox is not None:
+                bboxes[i] = _scale_bbox_xyxy(np.asarray(bbox, dtype=np.float32)[:4], w, h)
+            valid = row.get("valid_prob", row.get("roi_valid_prob", row.get("prob")))
+            if valid is not None:
+                valid_probs[i] = float(valid)
+        return bboxes, valid_probs
+
+    return None
+
+
+def _decode_localizer_output(common: Any, output, rgbs: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    for name in ("decode_localizer_output", "localizer_output_to_records", "localizer_output_to_bboxes"):
+        fn = getattr(common, name, None)
+        if fn is None:
+            continue
+        decoded = None
+        for args in ((output, rgbs), (output,)):
+            try:
+                decoded = fn(*args)
+                break
+            except TypeError:
+                continue
+        if decoded is not None:
+            coerced = _coerce_localizer_records(decoded, rgbs)
+            if coerced is not None:
+                return coerced
+
+    if isinstance(output, dict):
+        coerced = _coerce_localizer_records(output, rgbs)
+        if coerced is not None:
+            return coerced
+        output = output.get("mask", output.get("mask_logits", output.get("logits")))
+    if isinstance(output, (tuple, list)):
+        output = output[0]
+    if not isinstance(output, torch.Tensor):
+        raise TypeError(f"Unsupported ROI localizer output type: {type(output)!r}")
+
+    tensor = output.detach().float().cpu()
+    n = len(rgbs)
+    bboxes = np.full((n, 4), np.nan, dtype=np.float32)
+    valid_probs = np.full(n, np.nan, dtype=np.float32)
+    if tensor.dim() == 4:
+        if tensor.shape[1] > 1:
+            probs = torch.softmax(tensor, dim=1)[:, -1]
+        else:
+            probs = torch.sigmoid(tensor[:, 0])
+        for i in range(min(n, probs.shape[0])):
+            h, w = rgbs[i].shape[:2]
+            box, valid = _mask_to_bbox(probs[i].numpy(), w, h)
+            bboxes[i] = box
+            valid_probs[i] = valid
+        return bboxes, valid_probs
+    if tensor.dim() == 2 and tensor.shape[1] >= 4:
+        array = tensor.numpy()
+        for i in range(min(n, array.shape[0])):
+            h, w = rgbs[i].shape[:2]
+            bboxes[i] = _scale_bbox_xyxy(array[i, :4], w, h)
+            if array.shape[1] >= 5:
+                value = float(array[i, 4])
+                valid_probs[i] = 1.0 / (1.0 + math.exp(-value)) if value < 0.0 or value > 1.0 else value
+            elif np.isfinite(bboxes[i]).all():
+                valid_probs[i] = 1.0
+        return bboxes, valid_probs
+    if tensor.dim() == 2 and tensor.shape[1] == 2:
+        valid_probs[: min(n, tensor.shape[0])] = torch.softmax(tensor, dim=1)[:n, 1].numpy()
+        return bboxes, valid_probs
+    raise TypeError(f"Unsupported ROI localizer tensor shape: {tuple(tensor.shape)}")
+
+
+def _extract_localizer_map_tensor(output) -> torch.Tensor | None:
+    if isinstance(output, dict):
+        for key in ("prob_map", "prob_maps", "mask_prob", "mask_probs", "mask", "mask_logits", "logits"):
+            if key in output:
+                output = output[key]
+                break
+        else:
+            return None
+    if isinstance(output, (tuple, list)) and output:
+        output = output[0]
+    return output if isinstance(output, torch.Tensor) and output.dim() == 4 else None
+
+
+def _decode_localizer_prob_maps(output, rgbs: list[np.ndarray]) -> list[np.ndarray | None]:
+    maps: list[np.ndarray | None] = [None] * len(rgbs)
+    tensor = _extract_localizer_map_tensor(output)
+    if tensor is None:
+        return maps
+    tensor = tensor.detach().float().cpu()
+    if tensor.shape[1] > 1:
+        probs = torch.softmax(tensor, dim=1)[:, -1]
+    else:
+        flat = tensor[:, 0]
+        if flat.numel() and float(flat.amin()) >= 0.0 and float(flat.amax()) <= 1.0:
+            probs = flat
+        else:
+            probs = torch.sigmoid(flat)
+    for idx in range(min(len(rgbs), probs.shape[0])):
+        h, w = rgbs[idx].shape[:2]
+        prob_map = probs[idx].numpy().astype(np.float32)
+        prob_map = np.nan_to_num(prob_map, nan=0.0, posinf=1.0, neginf=0.0)
+        prob_map = np.clip(prob_map, 0.0, 1.0)
+        maps[idx] = cv2.resize(prob_map, (w, h), interpolation=cv2.INTER_LINEAR)
+    return maps
+
+
+def _decode_reflection_probs(common: Any, output, n: int) -> np.ndarray:
+    for name in ("decode_reflection_output", "reflection_output_to_probs", "decode_reflection_probs"):
+        fn = getattr(common, name, None)
+        if fn is None:
+            continue
+        decoded = None
+        for args in ((output,),):
+            try:
+                decoded = fn(*args)
+                break
+            except TypeError:
+                continue
+        if decoded is not None:
+            return _coerce_reflection_probs(decoded, n)
+    return _coerce_reflection_probs(output, n)
+
+
+def _coerce_reflection_probs(value, n: int) -> np.ndarray:
+    probs = np.full(n, np.nan, dtype=np.float32)
+    if isinstance(value, dict):
+        for key in ("reflect_prob", "reflect_probs", "reflection_prob", "reflection_probs", "prob", "probs"):
+            if key in value:
+                arr = value[key]
+                arr = arr.detach().cpu().numpy() if isinstance(arr, torch.Tensor) else arr
+                arr = np.asarray(arr, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] >= 2:
+                    flat = arr[:, 1].reshape(-1)
+                else:
+                    flat = arr.reshape(-1)
+                if flat.size and (float(np.nanmin(flat)) < 0.0 or float(np.nanmax(flat)) > 1.0):
+                    flat = _sigmoid_np(flat)
+                probs[: min(n, flat.size)] = flat[:n]
+                return probs
+        for key in ("logits", "reflect_logits", "reflection_logits"):
+            if key in value:
+                return _coerce_reflection_probs(value[key], n)
+    if isinstance(value, list) and (not value or isinstance(value[0], dict)):
+        for i, row in enumerate(value[:n]):
+            if row is None:
+                continue
+            for key in ("reflect_prob", "reflection_prob", "prob"):
+                if key in row:
+                    probs[i] = float(row[key])
+                    break
+        return probs
+    if isinstance(value, (tuple, list)):
+        value = value[0]
+    if not isinstance(value, torch.Tensor):
+        arr = np.asarray(value, dtype=np.float32)
+        probs[: min(n, arr.size)] = arr.reshape(-1)[:n]
+        return probs
+    tensor = value.detach().float().cpu()
+    if tensor.dim() == 2 and tensor.shape[1] >= 2:
+        arr = torch.softmax(tensor, dim=1)[:, 1].numpy()
+    else:
+        flat = tensor.reshape(-1)
+        if flat.numel() and float(flat.min()) >= 0.0 and float(flat.max()) <= 1.0:
+            arr = flat.numpy()
+        else:
+            arr = torch.sigmoid(flat).numpy()
+    probs[: min(n, arr.size)] = arr[:n]
+    return probs
+
+
 def _crop_roi(rgb: np.ndarray, bbox: np.ndarray) -> np.ndarray | None:
     if not np.isfinite(bbox).all():
         return None
@@ -880,6 +1233,30 @@ def _crop_roi(rgb: np.ndarray, bbox: np.ndarray) -> np.ndarray | None:
     right = max(left + 1, min(w, int(math.ceil(float(x2)))))
     bottom = max(top + 1, min(h, int(math.ceil(float(y2)))))
     return rgb[top:bottom, left:right]
+
+
+def _expand_roi_bbox(bbox: np.ndarray, width: int, height: int, cfg: dict[str, Any]) -> np.ndarray:
+    if not np.isfinite(bbox).all():
+        return bbox.astype(np.float32, copy=True)
+    x1, y1, x2, y2 = [float(value) for value in bbox]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    scale_w = float(cfg.get("roi_expand_w", 1.8))
+    scale_h = float(cfg.get("roi_expand_h", 1.6))
+    expanded = np.array(
+        [
+            max(0.0, cx - bw * scale_w / 2.0),
+            max(0.0, cy - bh * scale_h / 2.0),
+            min(float(width), cx + bw * scale_w / 2.0),
+            min(float(height), cy + bh * scale_h / 2.0),
+        ],
+        dtype=np.float32,
+    )
+    if expanded[2] <= expanded[0] or expanded[3] <= expanded[1]:
+        return np.full(4, np.nan, dtype=np.float32)
+    return expanded
 
 
 def format_bbox_xyxy(bbox: Iterable[float] | None) -> str:
@@ -930,7 +1307,7 @@ def infer_glottis_gate(
 
     for start in range(0, len(quality_indices), batch_size):
         batch_indices = quality_indices[start : start + batch_size]
-        tensors = [glottis_preprocess_frame(frame_model_rgb(frames[idx]), cfg) for idx in batch_indices]
+        tensors = [glottis_preprocess_frame(frames[idx]["rgb"], cfg) for idx in batch_indices]
         batch = torch.stack(tensors).to(device)
         batch = gpu_normalise(batch)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp and device.type == "cuda"):
@@ -972,154 +1349,12 @@ def annotate_glottis_gate(
         frame["glottis_gate_fallback_used"] = bool(fallback_used)
 
 
-def blackpad_padding(width: int, height: int, fraction: float, min_padding: int) -> int:
-    return max(int(min_padding), int(round(max(width, height) * float(fraction))))
-
-
-def add_black_border(rgb: np.ndarray, fraction: float, min_padding: int) -> tuple[np.ndarray, int]:
-    h, w = rgb.shape[:2]
-    padding = blackpad_padding(w, h, fraction=fraction, min_padding=min_padding)
-    padded = cv2.copyMakeBorder(
-        rgb,
-        padding,
-        padding,
-        padding,
-        padding,
-        borderType=cv2.BORDER_CONSTANT,
-        value=(0, 0, 0),
-    )
-    return padded, padding
-
-
-def crop_black_borders_rgb(rgb: np.ndarray, threshold: float = 15) -> tuple[np.ndarray, np.ndarray]:
-    x0, y0, x1, y1 = content_bbox_from_black_border(rgb, threshold=threshold)
-    if x1 <= x0 or y1 <= y0:
-        h, w = rgb.shape[:2]
-        return rgb, np.array([0.0, 0.0, float(w), float(h)], dtype=np.float32)
-    return rgb[y0:y1, x0:x1], np.array([x0, y0, x1, y1], dtype=np.float32)
-
-
-def square_resize_rgb(rgb: np.ndarray) -> np.ndarray:
-    h, w = rgb.shape[:2]
-    side = max(1, int(max(h, w)))
-    if h == side and w == side:
-        return rgb
-    return cv2.resize(rgb, (side, side), interpolation=cv2.INTER_LINEAR)
-
-
-def frame_model_rgb(frame: dict) -> np.ndarray:
-    value = frame.get("roi_model_rgb")
-    return value if isinstance(value, np.ndarray) else frame["rgb"]
-
-
-def _rect_soft_mask(shape: tuple[int, int], bbox: np.ndarray | None) -> np.ndarray | None:
-    if bbox is None or not np.isfinite(bbox).all():
-        return None
-    h, w = shape
-    x1, y1, x2, y2 = bbox
-    left = max(0, min(w - 1, int(math.floor(float(x1)))))
-    top = max(0, min(h - 1, int(math.floor(float(y1)))))
-    right = max(left + 1, min(w, int(math.ceil(float(x2)))))
-    bottom = max(top + 1, min(h, int(math.ceil(float(y2)))))
-    mask = np.zeros((h, w), dtype=np.float32)
-    mask[top:bottom, left:right] = 1.0
-    return mask
-
-
-def _fallback_square_roi(rgb: np.ndarray, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
-    cropped, bbox = crop_black_borders_rgb(rgb, threshold=float(args.roi_black_border_luma_floor))
-    return square_resize_rgb(cropped), bbox
-
-
-def _extract_best_yolo_candidate(
-    result: Any,
-    padding: int,
-    crop_bbox: np.ndarray,
-    cropped_width: int,
-    cropped_height: int,
-) -> dict[str, Any] | None:
-    boxes = getattr(result, "boxes", None)
-    if boxes is None or len(boxes) == 0:
-        return None
-    xyxy = boxes.xyxy.detach().cpu().numpy()
-    confs = boxes.conf.detach().cpu().numpy()
-    best = int(np.nanargmax(confs))
-    conf = float(confs[best])
-    cropped_box = xyxy[best].astype(np.float32, copy=True)
-    cropped_box[[0, 2]] -= float(padding)
-    cropped_box[[1, 3]] -= float(padding)
-    cropped_box = _scale_bbox_xyxy(cropped_box, cropped_width, cropped_height)
-    if not np.isfinite(cropped_box).all():
-        return None
-    original_box = cropped_box.copy()
-    original_box[[0, 2]] += float(crop_bbox[0])
-    original_box[[1, 3]] += float(crop_bbox[1])
-
-    cropped_keypoints: list[list[float]] | None = None
-    keypoints = getattr(result, "keypoints", None)
-    keypoint_data = getattr(keypoints, "data", None)
-    if keypoint_data is not None:
-        rows = keypoint_data.detach().cpu().numpy()[best]
-        cropped_keypoints = []
-        for row in rows[:3]:
-            cropped_keypoints.append(
-                [
-                    float(row[0]) - float(padding),
-                    float(row[1]) - float(padding),
-                    float(row[2]) if len(row) > 2 else conf,
-                ]
-            )
-    return {
-        "bbox": original_box,
-        "cropped_bbox": cropped_box,
-        "confidence": conf,
-        "cropped_keypoints": cropped_keypoints,
-    }
-
-
-def score_dino_aux_candidate(
-    bundle: DinoAuxBundle | None,
-    cropped_rgb: np.ndarray,
-    cropped_keypoints: list[list[float]] | None,
-    *,
-    padding_px: int,
-    frame_idx: int,
-) -> dict[str, Any] | None:
-    if bundle is None or cropped_keypoints is None or len(cropped_keypoints) < 3:
-        return None
-    image = Image.fromarray(cropped_rgb).convert("RGB")
-    dinov3_input = bundle.prediction_input_cls(
-        image=image,
-        keypoints=cropped_keypoints[:3],
-        image_source=f"video_frame_{frame_idx}#black_border_removed",
-        image_source_field="in_memory_cropped_frame",
-        padding_px=float(padding_px),
-        warnings=[],
-    )
-    record: dict[str, Any] = {"flags": []}
-    record = bundle.attach_aux_score(
-        record,
-        dinov3_input=dinov3_input,
-        extractor=bundle.extractor,
-        head=bundle.head,
-        aux_cfg=bundle.aux_cfg,
-        device=bundle.device,
-        imgsz=bundle.imgsz,
-    )
-    return record.get("dinov3_aux")
-
-
 def empty_roi_gate_result(n: int) -> dict[str, np.ndarray]:
     return {
         "bboxes": np.full((n, 4), np.nan, dtype=np.float32),
         "valid_probs": np.full(n, np.nan, dtype=np.float32),
-        "yolo_probs": np.full(n, np.nan, dtype=np.float32),
-        "dino_aux_scores": np.full(n, np.nan, dtype=np.float32),
-        "dino_aux_factors": np.full(n, np.nan, dtype=np.float32),
-        "dino_aux_direct_accept": np.zeros(n, dtype=bool),
         "reflect_probs": np.full(n, np.nan, dtype=np.float32),
         "soft_masks": np.full(n, None, dtype=object),
-        "model_rgbs": np.full(n, None, dtype=object),
         "severity": np.full(n, "not_evaluated", dtype=object),
         "keep": np.zeros(n, dtype=bool),
         "reason": np.full(n, "not_eligible_upstream", dtype=object),
@@ -1144,131 +1379,95 @@ def infer_roi_gate(
         return result
 
     if bundle is None:
-        for idx in eligible_indices:
-            result["keep"][idx] = False
-            result["severity"][idx] = "invalid"
-            result["reason"][idx] = "roi_model_missing_invalid_frame"
+        result["keep"][eligible_indices] = True
+        result["severity"][eligible_indices] = "model_missing"
+        result["reason"][eligible_indices] = "roi_model_missing_allowed"
         return result
 
-    yolo_batch_size = max(1, int(batch_size))
-    for start in range(0, len(eligible_indices), yolo_batch_size):
-        batch_indices = eligible_indices[start : start + yolo_batch_size]
-        cropped_rgbs: list[np.ndarray] = []
-        crop_bboxes: list[np.ndarray] = []
-        padded_rgbs: list[np.ndarray] = []
-        paddings: list[int] = []
-        for idx in batch_indices:
-            cropped_rgb, crop_bbox = crop_black_borders_rgb(
-                frames[idx]["rgb"],
-                threshold=float(args.roi_black_border_luma_floor),
-            )
-            padded, padding = add_black_border(
-                cropped_rgb,
-                fraction=float(args.roi_blackpad_fraction),
-                min_padding=int(args.roi_blackpad_min_padding),
-            )
-            cropped_rgbs.append(cropped_rgb)
-            crop_bboxes.append(crop_bbox)
-            padded_rgbs.append(padded)
-            paddings.append(padding)
-
-        predict_kwargs: dict[str, Any] = {
-            "source": [Image.fromarray(rgb) for rgb in padded_rgbs],
-            "conf": float(args.roi_valid_threshold),
-            "imgsz": int(args.roi_imgsz),
-            "stream": False,
-            "verbose": False,
-        }
-        if bundle.device_arg is not None:
-            predict_kwargs["device"] = bundle.device_arg
-        results = bundle.model.predict(**predict_kwargs)
-
-        for frame_idx, yolo_result, padding, cropped_rgb, crop_bbox in zip(
-            batch_indices,
-            results,
-            paddings,
-            cropped_rgbs,
-            crop_bboxes,
+    localizer_batch_size = max(1, int(batch_size))
+    for start in range(0, len(eligible_indices), localizer_batch_size):
+        batch_indices = eligible_indices[start : start + localizer_batch_size]
+        rgbs = [frames[idx]["rgb"] for idx in batch_indices]
+        tensors = [
+            _preprocess_roi_rgb(bundle.common, rgb, bundle.localizer_cfg, role="localizer")
+            for rgb in rgbs
+        ]
+        batch = torch.stack(tensors).to(bundle.device, non_blocking=True)
+        batch = _normalise_roi_batch(bundle.common, batch, role="localizer")
+        with torch.autocast(
+            device_type=bundle.device.type,
+            dtype=torch.float16,
+            enabled=use_amp and bundle.device.type == "cuda",
         ):
-            rgb = frames[frame_idx]["rgb"]
+            output = bundle.localizer_model(batch)
+        bboxes, valid_probs = _decode_localizer_output(bundle.common, output, rgbs)
+        soft_masks = _decode_localizer_prob_maps(output, rgbs)
+        for row_idx, rgb in enumerate(rgbs):
             h, w = rgb.shape[:2]
-            cropped_h, cropped_w = cropped_rgb.shape[:2]
-            candidate = _extract_best_yolo_candidate(
-                yolo_result,
-                padding,
-                crop_bbox,
-                cropped_w,
-                cropped_h,
-            )
-            if candidate is None:
-                result["valid_probs"][frame_idx] = float("nan")
-                result["severity"][frame_idx] = "invalid"
-                result["reason"][frame_idx] = "roi_reject_no_box"
-                result["keep"][frame_idx] = False
-                continue
+            bboxes[row_idx] = _expand_roi_bbox(bboxes[row_idx], w, h, bundle.localizer_cfg)
+        result["bboxes"][batch_indices] = bboxes
+        result["valid_probs"][batch_indices] = valid_probs
+        for frame_idx, soft_mask in zip(batch_indices, soft_masks):
+            result["soft_masks"][frame_idx] = soft_mask
 
-            bbox = candidate["bbox"]
-            conf = float(candidate["confidence"])
-            dino_aux = score_dino_aux_candidate(
-                bundle.aux,
-                cropped_rgb,
-                candidate.get("cropped_keypoints"),
-                padding_px=padding,
-                frame_idx=frame_idx,
-            )
-            confidence_factor = float(dino_aux.get("confidence_factor", 1.0)) if dino_aux else 1.0
-            direct_accept = bool(dino_aux.get("direct_accept", False)) if dino_aux else False
-            combined_conf = max(0.0, min(1.0, conf * confidence_factor))
-            if direct_accept:
-                combined_conf = max(combined_conf, float(args.roi_accept_threshold))
-            dino_score = float(dino_aux.get("point_region_score", np.nan)) if dino_aux else float("nan")
-            dino_ok = (
-                not args.roi_dino_aux
-                or direct_accept
-                or (np.isfinite(dino_score) and dino_score >= float(args.roi_dino_aux_accept_threshold))
-            )
-            roi_accepted = bool(combined_conf >= float(args.roi_accept_threshold) and dino_ok)
-            if not roi_accepted:
-                result["bboxes"][frame_idx] = bbox
-                result["valid_probs"][frame_idx] = combined_conf
-                result["yolo_probs"][frame_idx] = conf
-                if dino_aux:
-                    result["dino_aux_scores"][frame_idx] = dino_score
-                    result["dino_aux_factors"][frame_idx] = confidence_factor
-                    result["dino_aux_direct_accept"][frame_idx] = direct_accept
-                result["soft_masks"][frame_idx] = _rect_soft_mask((h, w), bbox)
-                result["severity"][frame_idx] = "invalid"
-                result["reason"][frame_idx] = "roi_reject_low_yolo_dino_score"
-                result["keep"][frame_idx] = False
-                continue
-
-            crop = _crop_roi(rgb, bbox)
+    reflection_indices = [
+        idx for idx in eligible_indices
+        if (
+            np.isfinite(result["valid_probs"][idx])
+            and float(result["valid_probs"][idx]) >= float(args.roi_valid_threshold)
+            and np.isfinite(result["bboxes"][idx]).all()
+        )
+    ]
+    for start in range(0, len(reflection_indices), localizer_batch_size):
+        batch_indices = reflection_indices[start : start + localizer_batch_size]
+        crops: list[np.ndarray] = []
+        crop_frame_indices: list[int] = []
+        for idx in batch_indices:
+            crop = _crop_roi(frames[idx]["rgb"], result["bboxes"][idx])
             if crop is None:
-                result["bboxes"][frame_idx] = bbox
-                result["yolo_probs"][frame_idx] = conf
-                result["valid_probs"][frame_idx] = combined_conf
-                if dino_aux:
-                    result["dino_aux_scores"][frame_idx] = dino_score
-                    result["dino_aux_factors"][frame_idx] = confidence_factor
-                    result["dino_aux_direct_accept"][frame_idx] = direct_accept
-                result["soft_masks"][frame_idx] = _rect_soft_mask((h, w), bbox)
-                result["severity"][frame_idx] = "invalid"
-                result["reason"][frame_idx] = "roi_reject_empty_crop"
-                result["keep"][frame_idx] = False
                 continue
+            crops.append(crop)
+            crop_frame_indices.append(idx)
+        if not crops:
+            continue
+        tensors = [
+            _preprocess_roi_rgb(bundle.common, crop, bundle.reflection_cfg, role="reflection")
+            for crop in crops
+        ]
+        batch = torch.stack(tensors).to(bundle.device, non_blocking=True)
+        batch = _normalise_roi_batch(bundle.common, batch, role="reflection")
+        with torch.autocast(
+            device_type=bundle.device.type,
+            dtype=torch.float16,
+            enabled=use_amp and bundle.device.type == "cuda",
+        ):
+            output = bundle.reflection_model(batch)
+        reflect_probs = _decode_reflection_probs(bundle.common, output, len(crops))
+        result["reflect_probs"][crop_frame_indices] = reflect_probs
 
-            result["bboxes"][frame_idx] = bbox
-            result["valid_probs"][frame_idx] = combined_conf
-            result["yolo_probs"][frame_idx] = conf
-            if dino_aux:
-                result["dino_aux_scores"][frame_idx] = dino_score
-                result["dino_aux_factors"][frame_idx] = confidence_factor
-                result["dino_aux_direct_accept"][frame_idx] = direct_accept
-            result["model_rgbs"][frame_idx] = square_resize_rgb(crop)
-            result["soft_masks"][frame_idx] = _rect_soft_mask((h, w), bbox)
-            result["severity"][frame_idx] = "detected_dinov3_aux" if dino_aux else "detected"
-            result["reason"][frame_idx] = "roi_detected_dinov3_aux" if dino_aux else "roi_detected"
-            result["keep"][frame_idx] = True
+    for idx in eligible_indices:
+        valid_prob = result["valid_probs"][idx]
+        reflect_prob = result["reflect_probs"][idx]
+        if not np.isfinite(valid_prob) or float(valid_prob) < float(args.roi_valid_threshold):
+            result["severity"][idx] = "invalid_roi"
+            result["reason"][idx] = "roi_invalid"
+            continue
+        if not np.isfinite(reflect_prob):
+            result["severity"][idx] = "reflection_unknown"
+            result["reason"][idx] = "roi_reflection_unknown"
+            continue
+        if float(reflect_prob) >= float(args.roi_severe_reflect_threshold):
+            result["severity"][idx] = "severe"
+            result["reason"][idx] = "roi_reflection_severe"
+            continue
+        if float(reflect_prob) >= float(args.roi_reflect_threshold):
+            result["severity"][idx] = "mild"
+            result["reason"][idx] = "roi_reflection_mild"
+            result["keep"][idx] = True
+            continue
+        result["severity"][idx] = "none"
+        result["reason"][idx] = "roi_pass"
+        result["keep"][idx] = True
 
     return result
 
@@ -1283,37 +1482,21 @@ def annotate_roi_gate(
         if not args.roi_gate or roi_result is None:
             frame["roi_bbox_xyxy"] = ""
             frame["roi_valid_prob"] = float("nan")
-            frame["roi_yolo_prob"] = float("nan")
-            frame["roi_dino_aux_score"] = float("nan")
-            frame["roi_dino_aux_factor"] = float("nan")
-            frame["roi_dino_aux_direct_accept"] = False
             frame["roi_reflect_prob"] = float("nan")
             frame["roi_reflect_severity"] = "not_run"
             frame["roi_gate_keep"] = True
             frame["roi_filter_reason"] = "roi_gate_disabled"
             frame["_roi_soft_mask"] = None
-            frame["_roi_crop_bbox"] = None
-            frame["roi_model_rgb"] = square_resize_rgb(frame["rgb"])
             continue
         frame["roi_bbox_xyxy"] = format_bbox_xyxy(roi_result["bboxes"][idx])
         valid_prob = roi_result["valid_probs"][idx]
-        yolo_prob = roi_result["yolo_probs"][idx]
-        dino_score = roi_result["dino_aux_scores"][idx]
-        dino_factor = roi_result["dino_aux_factors"][idx]
         reflect_prob = roi_result["reflect_probs"][idx]
         frame["roi_valid_prob"] = float(valid_prob) if np.isfinite(valid_prob) else float("nan")
-        frame["roi_yolo_prob"] = float(yolo_prob) if np.isfinite(yolo_prob) else float("nan")
-        frame["roi_dino_aux_score"] = float(dino_score) if np.isfinite(dino_score) else float("nan")
-        frame["roi_dino_aux_factor"] = float(dino_factor) if np.isfinite(dino_factor) else float("nan")
-        frame["roi_dino_aux_direct_accept"] = bool(roi_result["dino_aux_direct_accept"][idx])
         frame["roi_reflect_prob"] = float(reflect_prob) if np.isfinite(reflect_prob) else float("nan")
         frame["roi_reflect_severity"] = str(roi_result["severity"][idx])
         frame["roi_gate_keep"] = bool(roi_result["keep"][idx])
         frame["roi_filter_reason"] = str(roi_result["reason"][idx])
         frame["_roi_soft_mask"] = roi_result["soft_masks"][idx]
-        frame["_roi_crop_bbox"] = roi_result["bboxes"][idx]
-        model_rgb = roi_result["model_rgbs"][idx]
-        frame["roi_model_rgb"] = model_rgb if isinstance(model_rgb, np.ndarray) else square_resize_rgb(frame["rgb"])
 
 
 def roi_gate_keep_mask(frames: list[dict], args: argparse.Namespace) -> np.ndarray:
@@ -1322,28 +1505,13 @@ def roi_gate_keep_mask(frames: list[dict], args: argparse.Namespace) -> np.ndarr
     return np.array([bool(frame.get("roi_gate_keep", False)) for frame in frames], dtype=bool)
 
 
-def apply_video_level_roi_fallback(frames: list[dict], upstream_mask: np.ndarray) -> np.ndarray:
-    fallback_keep = np.array([bool(value) for value in upstream_mask], dtype=bool)
-    for idx, keep in enumerate(fallback_keep):
-        if not keep:
-            continue
-        frame = frames[idx]
-        frame["roi_gate_keep"] = True
-        frame["roi_filter_reason"] = "roi_video_fallback_full_frame"
-        frame["roi_reflect_severity"] = "video_fallback_full_frame"
-        frame["_roi_soft_mask"] = None
-        frame["_roi_crop_bbox"] = None
-        frame["roi_model_rgb"] = frame["rgb"]
-    return fallback_keep
-
-
 def roi_reason_counts(frames: list[dict], enabled: bool) -> Counter:
     counts: Counter = Counter()
     if not enabled:
         return counts
     for frame in frames:
         reason = str(frame.get("roi_filter_reason", ""))
-        if reason in {"", "roi_pass", "roi_detected", "roi_detected_dinov3_aux", "roi_gate_disabled", "not_eligible_upstream"}:
+        if reason in {"", "roi_pass", "roi_gate_disabled", "not_eligible_upstream"}:
             continue
         counts[reason] += 1
     return counts
@@ -1380,21 +1548,20 @@ def roi_video_stats(frames: list[dict], args: argparse.Namespace) -> dict[str, A
             "roi_filter_reasons": "",
         }
     reasons = roi_reason_counts(frames, enabled=True)
-    invalid_reasons = {
-        "roi_model_missing_invalid_frame",
-        "roi_reject_no_box",
-        "roi_reject_low_yolo_dino_score",
-        "roi_reject_empty_crop",
-    }
+    filtered_reasons = {"roi_invalid", "roi_reflection_severe", "roi_reflection_unknown"}
     return {
         "roi_gate_enabled": True,
         "roi_gate_keep_frames": int(sum(bool(frame.get("roi_gate_keep")) for frame in frames)),
         "roi_gate_filtered_frames": int(
-            sum(str(frame.get("roi_filter_reason")) in invalid_reasons for frame in frames)
+            sum(str(frame.get("roi_filter_reason")) in filtered_reasons for frame in frames)
         ),
-        "roi_invalid_frames": int(sum(str(frame.get("roi_filter_reason")) in invalid_reasons for frame in frames)),
-        "roi_reflection_mild_frames": 0,
-        "roi_reflection_severe_frames": 0,
+        "roi_invalid_frames": int(sum(str(frame.get("roi_filter_reason")) == "roi_invalid" for frame in frames)),
+        "roi_reflection_mild_frames": int(
+            sum(str(frame.get("roi_filter_reason")) == "roi_reflection_mild" for frame in frames)
+        ),
+        "roi_reflection_severe_frames": int(
+            sum(str(frame.get("roi_filter_reason")) == "roi_reflection_severe" for frame in frames)
+        ),
         "roi_filter_reasons": format_reason_counts(reasons),
     }
 
@@ -1424,7 +1591,7 @@ def infer_frames(
         batch_indices = kept_indices[start : start + batch_size]
         tensors = []
         for idx in batch_indices:
-            img = Image.fromarray(frame_model_rgb(frames[idx]))
+            img = Image.fromarray(frames[idx]["rgb"])
             tensors.append(preprocess(img))
         batch = torch.stack(tensors).to(device)
         batch = gpu_normalise(batch)
@@ -1593,14 +1760,12 @@ def build_diagnosis_record(
     selected_time = float("nan")
     selected_prob = float("nan")
     selected_rgb = None
-    selected_model_rgb = None
     if finite_pred.any():
         candidate_indices = np.where(finite_pred)[0]
         best_frame_idx = int(candidate_indices[np.argmax(probs[candidate_indices, pred_idx])])
         selected_time = float(times[best_frame_idx])
         selected_prob = float(probs[best_frame_idx, pred_idx])
         selected_rgb = frames[best_frame_idx]["rgb"]
-        selected_model_rgb = frame_model_rgb(frames[best_frame_idx])
 
     evidence_mask = finite_pred & (probs[:, pred_idx] >= args.frame_threshold)
     evidence_segments = merge_segments(times, evidence_mask, args.sample_fps, max_gap_sec=args.max_segment_gap_sec)
@@ -1678,10 +1843,6 @@ def build_diagnosis_record(
         "roi_filter_reasons": row.get("roi_filter_reasons", ""),
         "selected_roi_bbox_xyxy": selected_frame.get("roi_bbox_xyxy", ""),
         "selected_roi_valid_prob": selected_frame.get("roi_valid_prob", float("nan")),
-        "selected_roi_yolo_prob": selected_frame.get("roi_yolo_prob", float("nan")),
-        "selected_roi_dino_aux_score": selected_frame.get("roi_dino_aux_score", float("nan")),
-        "selected_roi_dino_aux_factor": selected_frame.get("roi_dino_aux_factor", float("nan")),
-        "selected_roi_dino_aux_direct_accept": selected_frame.get("roi_dino_aux_direct_accept", False),
         "selected_roi_reflect_prob": selected_frame.get("roi_reflect_prob", float("nan")),
         "selected_roi_reflect_severity": selected_frame.get("roi_reflect_severity", ""),
         "selected_roi_filter_reason": selected_frame.get("roi_filter_reason", ""),
@@ -1693,7 +1854,6 @@ def build_diagnosis_record(
         "low_confidence_reasons": ";".join(low_confidence_reasons),
         "gradcam_path": "",
         "_selected_rgb": selected_rgb,
-        "_selected_model_rgb": selected_model_rgb if best_frame_idx is not None else None,
         "_pred_idx": pred_idx,
     }
 
@@ -1750,8 +1910,10 @@ def score_video(
         "glottis_gate_fallback_used": bool(frames[0].get("glottis_gate_fallback_used", False)) if frames else False,
         **roi_stats,
         "roi_valid_threshold": float(args.roi_valid_threshold) if args.roi_gate else float("nan"),
-        "roi_reflect_threshold": float("nan"),
-        "roi_severe_reflect_threshold": float("nan"),
+        "roi_reflect_threshold": float(args.roi_reflect_threshold) if args.roi_gate else float("nan"),
+        "roi_severe_reflect_threshold": (
+            float(args.roi_severe_reflect_threshold) if args.roi_gate else float("nan")
+        ),
         "gate_frames": int(gate_mask.sum()),
         "gate_duration_sec": float(gate_mask.sum() / args.sample_fps),
         "gate_segments": format_segments(gate_segments),
@@ -1843,10 +2005,6 @@ def write_frame_rows(
             "roi_gate_enabled": row.get("roi_gate_enabled", False),
             "roi_bbox_xyxy": row.get("roi_bbox_xyxy", ""),
             "roi_valid_prob": row.get("roi_valid_prob", float("nan")),
-            "roi_yolo_prob": row.get("roi_yolo_prob", float("nan")),
-            "roi_dino_aux_score": row.get("roi_dino_aux_score", float("nan")),
-            "roi_dino_aux_factor": row.get("roi_dino_aux_factor", float("nan")),
-            "roi_dino_aux_direct_accept": row.get("roi_dino_aux_direct_accept", False),
             "roi_reflect_prob": row.get("roi_reflect_prob", float("nan")),
             "roi_reflect_severity": row.get("roi_reflect_severity", "not_run"),
             "roi_gate_keep": row.get("roi_gate_keep", True),
@@ -1940,13 +2098,10 @@ def save_gradcam_comparisons(
     model.eval()
     for record in records_with_frames:
         raw_rgb = record["_selected_rgb"]
-        source_rgb = record.get("_selected_model_rgb")
-        if not isinstance(source_rgb, np.ndarray):
-            source_rgb = raw_rgb
         pred_idx = int(record["_pred_idx"])
-        model_source_pil = Image.fromarray(source_rgb)
-        model_input_rgb = np.array(visual_preprocess(model_source_pil), dtype=np.uint8)
-        image_tensor = tensor_preprocess(model_source_pil).unsqueeze(0).to(device)
+        raw_pil = Image.fromarray(raw_rgb)
+        model_input_rgb = np.array(visual_preprocess(raw_pil), dtype=np.uint8)
+        image_tensor = tensor_preprocess(raw_pil).unsqueeze(0).to(device)
         image_tensor = gpu_normalise(image_tensor)
         cam_input = image_tensor.detach().clone().requires_grad_(True)
         target = [ClassifierOutputTarget(pred_idx)]
@@ -2023,9 +2178,9 @@ def draw_shadow_text(
     draw.text((x, y), text, font=font, fill=fill)
 
 
-def content_bbox_from_black_border(rgb: np.ndarray, threshold: float = 15) -> tuple[int, int, int, int]:
+def content_bbox_from_black_border(rgb: np.ndarray, threshold: int = 15) -> tuple[int, int, int, int]:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    coords = np.argwhere(gray > float(threshold))
+    coords = np.argwhere(gray > int(threshold))
     h, w = gray.shape[:2]
     if coords.size == 0:
         return 0, 0, w, h
@@ -2082,23 +2237,6 @@ def cam_to_frame_map(raw_rgb: np.ndarray, cam_map: np.ndarray, cfg: dict) -> np.
     return full
 
 
-def cam_to_frame_map_for_frame(frame: dict, cam_map: np.ndarray, cfg: dict) -> np.ndarray:
-    raw_rgb = frame["rgb"]
-    h, w = raw_rgb.shape[:2]
-    full = np.zeros((h, w), dtype=np.float32)
-    bbox = frame.get("_roi_crop_bbox")
-    if isinstance(bbox, np.ndarray) and np.isfinite(bbox).all():
-        x1, y1, x2, y2 = bbox
-        left = max(0, min(w - 1, int(math.floor(float(x1)))))
-        top = max(0, min(h - 1, int(math.floor(float(y1)))))
-        right = max(left + 1, min(w, int(math.ceil(float(x2)))))
-        bottom = max(top + 1, min(h, int(math.ceil(float(y2)))))
-        resized = cv2.resize(cam_map.astype(np.float32), (right - left, bottom - top), interpolation=cv2.INTER_LINEAR)
-        full[top:bottom, left:right] = np.clip(resized, 0.0, 1.0)
-        return full
-    return cam_to_frame_map(raw_rgb, cam_map, cfg)
-
-
 def overlay_cam_on_frame(rgb: np.ndarray, cam_map: np.ndarray | None) -> np.ndarray:
     if cam_map is None:
         return rgb
@@ -2138,13 +2276,14 @@ def compute_render_cam_maps(
     )
     model.eval()
     for idx in valid_indices:
-        raw_pil = Image.fromarray(frame_model_rgb(frames[idx]))
+        raw_rgb = frames[idx]["rgb"]
+        raw_pil = Image.fromarray(raw_rgb)
         image_tensor = tensor_preprocess(raw_pil).unsqueeze(0).to(device)
         image_tensor = gpu_normalise(image_tensor)
         cam_input = image_tensor.detach().clone().requires_grad_(True)
         with torch.enable_grad():
             grayscale_cam = cam(input_tensor=cam_input, targets=[ClassifierOutputTarget(pred_idx)])[0]
-        maps[idx] = cam_to_frame_map_for_frame(frames[idx], grayscale_cam, cfg)
+        maps[idx] = cam_to_frame_map(raw_rgb, grayscale_cam, cfg)
     cam.activations_and_grads.release()
     return maps
 
@@ -2272,7 +2411,7 @@ def draw_render_panel(
     prob = probs[frame_idx]
     final_label = LABEL_NAMES[pred_idx]
     final_call = label_zh(final_label) if final_longest_evidence >= float(args.min_evidence_duration_sec) else "待人工复核"
-    valid_text = "有效ROI帧" if state["valid"] else "无效/未入池"
+    valid_text = "有效声门帧" if state["valid"] else "无效/未入池"
     valid_color = (92, 220, 150) if state["valid"] else (240, 120, 90)
     if np.isfinite(prob[candidate_indices]).all():
         current_idx = candidate_indices[int(np.argmax(prob[candidate_indices]))]
@@ -2280,10 +2419,8 @@ def draw_render_panel(
     else:
         current_text = "-"
     glottis_prob = frame.get("glottis_prob", float("nan"))
-    glottis_enabled = bool(frame.get("glottis_gate_enabled", False))
     glottis_value = 1 if bool(frame.get("glottis_gate_keep", False)) else 0
     roi_valid = frame.get("roi_valid_prob", float("nan"))
-    roi_dino = frame.get("roi_dino_aux_score", float("nan"))
     roi_reflect = frame.get("roi_reflect_prob", float("nan"))
     roi_severity = str(frame.get("roi_reflect_severity", ""))
 
@@ -2295,19 +2432,14 @@ def draw_render_panel(
     y += 38
     draw_shadow_text(draw, (x, y), f"状态: {valid_text}", font_main, valid_color)
     y += 38
-    if glottis_enabled:
-        glottis_prob_text = f"{float(glottis_prob):.2f}" if np.isfinite(glottis_prob) else "-"
-        glottis_text = f"声门区域(0/1): {glottis_value}  p={glottis_prob_text}"
-    else:
-        glottis_text = "声门0/1 gate: 未启用"
-    draw_shadow_text(draw, (x, y), glottis_text, font_small)
+    glottis_prob_text = f"{float(glottis_prob):.2f}" if np.isfinite(glottis_prob) else "-"
+    draw_shadow_text(draw, (x, y), f"声门区域(0/1): {glottis_value}  p={glottis_prob_text}", font_small)
     y += 30
     draw_shadow_text(draw, (x, y), f"当前Top1: {current_text}", font_small)
     y += 30
     roi_valid_text = f"{float(roi_valid):.2f}" if np.isfinite(roi_valid) else "-"
-    roi_dino_text = f"{float(roi_dino):.2f}" if np.isfinite(roi_dino) else "-"
     roi_reflect_text = f"{float(roi_reflect):.2f}" if np.isfinite(roi_reflect) else "-"
-    draw_shadow_text(draw, (x, y), f"ROI valid={roi_valid_text}  DINO={roi_dino_text}  reflect={roi_reflect_text}", font_small)
+    draw_shadow_text(draw, (x, y), f"ROI valid={roi_valid_text}  reflect={roi_reflect_text}", font_small)
     y += 28
     draw_shadow_text(draw, (x, y), f"ROI状态: {roi_severity}", font_small)
     y += 34
@@ -2488,10 +2620,6 @@ def public_diagnosis_columns() -> list[str]:
         "roi_filter_reasons",
         "selected_roi_bbox_xyxy",
         "selected_roi_valid_prob",
-        "selected_roi_yolo_prob",
-        "selected_roi_dino_aux_score",
-        "selected_roi_dino_aux_factor",
-        "selected_roi_dino_aux_direct_accept",
         "selected_roi_reflect_prob",
         "selected_roi_reflect_severity",
         "selected_roi_filter_reason",
@@ -2577,10 +2705,6 @@ def write_diagnosis_outputs(
                     "roi_filter_reasons": selected_record["roi_filter_reasons"],
                     "selected_roi_bbox_xyxy": selected_record["selected_roi_bbox_xyxy"],
                     "selected_roi_valid_prob": selected_record["selected_roi_valid_prob"],
-                    "selected_roi_yolo_prob": selected_record["selected_roi_yolo_prob"],
-                    "selected_roi_dino_aux_score": selected_record["selected_roi_dino_aux_score"],
-                    "selected_roi_dino_aux_factor": selected_record["selected_roi_dino_aux_factor"],
-                    "selected_roi_dino_aux_direct_accept": selected_record["selected_roi_dino_aux_direct_accept"],
                     "selected_roi_reflect_prob": selected_record["selected_roi_reflect_prob"],
                     "selected_roi_reflect_severity": selected_record["selected_roi_reflect_severity"],
                     "selected_roi_filter_reason": selected_record["selected_roi_filter_reason"],
@@ -2670,22 +2794,13 @@ def summarize(video_rows: list[dict], candidate_indices: list[int], args: argpar
         },
         "roi_gate": {
             "enabled": bool(args.roi_gate),
+            "common_module": str(ROI_COMMON_PATH) if args.roi_gate else "",
             "localizer_model": str(args.roi_localizer_model) if args.roi_gate else "",
-            "localizer_type": "yolo_pose_dinov3_strict_roi_crop",
-            "dino_aux_enabled": bool(args.roi_gate and args.roi_dino_aux),
-            "dino_aux_model": str(args.roi_dino_aux_model) if args.roi_gate and args.roi_dino_aux else "",
-            "dino_aux_code_root": str(args.roi_dino_aux_code_root) if args.roi_gate and args.roi_dino_aux else "",
-            "dino_aux_imgsz": int(args.roi_dino_aux_imgsz or 0) if args.roi_gate and args.roi_dino_aux else "",
-            "bbox_conf_threshold": float(args.roi_valid_threshold),
-            "accept_threshold": float(args.roi_accept_threshold),
-            "dino_aux_accept_threshold": float(args.roi_dino_aux_accept_threshold),
-            "imgsz": int(args.roi_imgsz),
-            "blackpad_fraction": float(args.roi_blackpad_fraction),
-            "blackpad_min_padding": int(args.roi_blackpad_min_padding),
-            "black_border_luma_floor": float(args.roi_black_border_luma_floor),
+            "reflection_model": str(args.roi_reflection_model) if args.roi_gate else "",
+            "valid_threshold": float(args.roi_valid_threshold),
+            "reflect_threshold": float(args.roi_reflect_threshold),
+            "severe_reflect_threshold": float(args.roi_severe_reflect_threshold),
             "cache_device": str(args.roi_cache_device),
-            "dino_aux_device": str(args.roi_dino_aux_device),
-            "video_level_full_frame_fallback": bool(args.roi_video_fallback),
             "allow_missing_model": bool(args.roi_allow_missing_model),
             "keep_frames": (
                 int(sum(int(row.get("roi_gate_keep_frames") or 0) for row in unique_video_rows.values()))
@@ -2738,20 +2853,12 @@ def main() -> None:
     if args.roi_gate:
         if not (0.0 <= float(args.roi_valid_threshold) <= 1.0):
             raise ValueError("--roi-valid-threshold must be between 0 and 1.")
-        if not (0.0 <= float(args.roi_accept_threshold) <= 1.0):
-            raise ValueError("--roi-accept-threshold must be between 0 and 1.")
-        if not (0.0 <= float(args.roi_dino_aux_accept_threshold) <= 1.0):
-            raise ValueError("--roi-dino-aux-accept-threshold must be between 0 and 1.")
-        if int(args.roi_imgsz) <= 0:
-            raise ValueError("--roi-imgsz must be positive.")
-        if args.roi_dino_aux and args.roi_dino_aux_imgsz is not None and int(args.roi_dino_aux_imgsz) <= 0:
-            raise ValueError("--roi-dino-aux-imgsz must be positive.")
-        if float(args.roi_blackpad_fraction) < 0.0:
-            raise ValueError("--roi-blackpad-fraction must be non-negative.")
-        if int(args.roi_blackpad_min_padding) < 0:
-            raise ValueError("--roi-blackpad-min-padding must be non-negative.")
-        if float(args.roi_black_border_luma_floor) < 0.0:
-            raise ValueError("--roi-black-border-luma-floor must be non-negative.")
+        if not (0.0 <= float(args.roi_reflect_threshold) <= 1.0):
+            raise ValueError("--roi-reflect-threshold must be between 0 and 1.")
+        if not (0.0 <= float(args.roi_severe_reflect_threshold) <= 1.0):
+            raise ValueError("--roi-severe-reflect-threshold must be between 0 and 1.")
+        if float(args.roi_reflect_threshold) > float(args.roi_severe_reflect_threshold):
+            raise ValueError("--roi-reflect-threshold must be <= --roi-severe-reflect-threshold.")
 
     folder_map = load_folder_label_map(args.folder_label_map)
     items = (
@@ -2783,13 +2890,12 @@ def main() -> None:
     roi_bundle = None
     if args.roi_gate:
         roi_bundle = build_roi_gate_bundle(args, device)
+        roi_device = roi_bundle.device if roi_bundle is not None else resolve_roi_device(args.roi_cache_device, device)
         print(
-            "YOLO-Pose + DINOv3 ROI: "
-            f"weights={args.roi_localizer_model}, detect_conf>={args.roi_valid_threshold:.2f}, "
-            f"accept>={args.roi_accept_threshold:.2f}, dino>={args.roi_dino_aux_accept_threshold:.2f}, "
-            f"imgsz={args.roi_imgsz}, blackpad={args.roi_blackpad_fraction:.2f}/"
-            f"{args.roi_blackpad_min_padding}px, "
-            f"dino_aux={args.roi_dino_aux_model if args.roi_dino_aux else 'disabled'}"
+            "ROI gate: "
+            f"localizer={args.roi_localizer_model}, reflection={args.roi_reflection_model}, "
+            f"valid>={args.roi_valid_threshold:.2f}, mild>={args.roi_reflect_threshold:.2f}, "
+            f"severe>={args.roi_severe_reflect_threshold:.2f}, device={roi_device}"
         )
 
     preprocess = _build_base_preprocess(cfg, to_tensor=True)
@@ -2829,10 +2935,6 @@ def main() -> None:
         "roi_gate_enabled",
         "roi_bbox_xyxy",
         "roi_valid_prob",
-        "roi_yolo_prob",
-        "roi_dino_aux_score",
-        "roi_dino_aux_factor",
-        "roi_dino_aux_direct_accept",
         "roi_reflect_prob",
         "roi_reflect_severity",
         "roi_gate_keep",
@@ -2855,6 +2957,21 @@ def main() -> None:
             print(f"Processing {item.video_id}: {item.video_path}")
             frames = sample_video_frames(item, args.sample_fps, args)
             quality_keep = np.array([bool(frame["quality_keep"]) for frame in frames], dtype=bool)
+            if args.roi_gate:
+                roi_result = infer_roi_gate(
+                    frames,
+                    roi_bundle,
+                    args,
+                    eligible_mask=quality_keep,
+                    batch_size=args.batch_size,
+                    use_amp=args.amp,
+                )
+                annotate_roi_gate(frames, roi_result, args)
+                roi_keep = np.array([bool(value) for value in roi_result["keep"]], dtype=bool)
+            else:
+                annotate_roi_gate(frames, None, args)
+                roi_keep = np.ones(len(frames), dtype=bool)
+            glottis_eligible = quality_keep & roi_keep
             if args.glottis_gate:
                 glottis_probs, glottis_keep, used_threshold, fallback_used = infer_glottis_gate(
                     glottis_model,
@@ -2866,7 +2983,7 @@ def main() -> None:
                     args.glottis_gate_threshold,
                     args.glottis_gate_fallback_threshold,
                     args.min_glottis_gate_frames,
-                    eligible_mask=quality_keep,
+                    eligible_mask=glottis_eligible,
                 )
             else:
                 glottis_probs = None
@@ -2881,23 +2998,6 @@ def main() -> None:
                 fallback_used,
                 args.glottis_gate,
             )
-            roi_eligible = quality_keep & glottis_keep
-            if args.roi_gate:
-                roi_result = infer_roi_gate(
-                    frames,
-                    roi_bundle,
-                    args,
-                    eligible_mask=roi_eligible,
-                    batch_size=args.batch_size,
-                    use_amp=args.amp,
-                )
-                annotate_roi_gate(frames, roi_result, args)
-                roi_keep = np.array([bool(value) for value in roi_result["keep"]], dtype=bool)
-                if args.roi_video_fallback and not bool(roi_keep.any()) and bool(roi_eligible.any()):
-                    roi_keep = apply_video_level_roi_fallback(frames, roi_eligible)
-            else:
-                annotate_roi_gate(frames, None, args)
-                roi_keep = np.ones(len(frames), dtype=bool)
             inference_keep = quality_keep & roi_keep & glottis_keep
             probs = infer_frames(
                 model,

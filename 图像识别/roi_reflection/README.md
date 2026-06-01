@@ -66,6 +66,8 @@ python 图像识别/roi_reflection/crop_project_rois.py \
 
 `crop_project_rois.py` 是 8 分类训练前的数据预处理，不启动训练、不修改源数据，也不把 ROI 当作 sidecar weight 注入训练循环。裁切默认走分类安全模式：先用黑边检测得到有效图像区域，再以 ROI bbox 中心为参考，在有效区域内扩到最小上下文尺寸；默认 `--min-crop-width-ratio 0.60`、`--min-crop-height-ratio 0.60`、`--min-crop-area-ratio 0.50`、`--max-crop-area-ratio 1.00`。无 ROI、ROI 面积低于 `--min-roi-area-ratio`、或安全裁切仍低于阈值时，默认保存黑边裁切后的图像，避免把 1%-5% 的小条/小块送入主分类训练。
 
+需要只裁切实验清单中的部分图片时，可传入 `--include-list`。CSV 清单支持 `image_path`、`input_path`、`relative_path` 或 `path` 任一列；TXT 清单则每行一个相对或绝对路径。该参数只限制裁切范围，不改变 ROI localizer 或裁切安全策略。
+
 CUDA 可用时，`crop_project_rois.py` 默认用 `--postprocess-device auto` 在 GPU 上完成 ROI 概率图还原、ensemble 平均、阈值化、ROI 面积和 bbox 提取，只把最终 bbox 数字拿回 CPU 做裁剪与落盘。若要复现旧的 CPU 后处理路径，可显式加 `--postprocess-device cpu`。
 
 `manifest.csv` 记录 `input_path`、`output_path`、`bbox`、`valid_prob`、`crop_status`、`safe_crop_status`、`class_folder`、原图尺寸、输出 crop 尺寸、`crop_area_ratio`、raw ROI bbox、expanded ROI bbox、safe ROI bbox 和 black-border 有效区域，便于审计 raw ROI、expanded safe ROI 与 fallback 的差异。

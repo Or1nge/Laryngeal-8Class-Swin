@@ -44,9 +44,7 @@ def resolve_phase3_checkpoint(cfg):
 
 def set_phase4_trainable(model, train_backbone):
     if train_backbone:
-        for param in model.projector.parameters():
-            param.requires_grad = False
-        for param in model.classifier.parameters():
+        for param in model.parameters():
             param.requires_grad = True
     else:
         for param in model.backbone.parameters():
@@ -95,31 +93,6 @@ def main():
     model.load_state_dict(torch.load(phase3_checkpoint, map_location=device), strict=True)
     print(f"Loaded Phase 3 checkpoint: {phase3_checkpoint}")
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
-    cls_metrics = create_classification_metrics(num_classes, device)
-    score_f1_weight = float(cfg.get("selection_f1_weight", 0.7))
-    score_auc_weight = float(cfg.get("selection_auc_weight", 0.3))
-    weight_sum = score_f1_weight + score_auc_weight
-    if weight_sum <= 0:
-        raise ValueError("selection_f1_weight + selection_auc_weight must be positive.")
-    score_f1_weight /= weight_sum
-    score_auc_weight /= weight_sum
-    early_min_delta = cfg.get("early_stopping_min_delta", 0.0)
-
-    baseline_val_metrics = evaluate(
-        model, loaders["val"], criterion, device, num_classes, cls_metrics=cls_metrics
-    )
-    baseline_val_score = (
-        score_f1_weight * baseline_val_metrics["f1"]
-        + score_auc_weight * baseline_val_metrics["auc"]
-    )
-    baseline_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    print(
-        f"Phase 3 baseline validation score before Phase 4 reset: "
-        f"{baseline_val_score:.4f} "
-        f"(F1={baseline_val_metrics['f1']:.4f}, AUC={baseline_val_metrics['auc']:.4f})"
-    )
-
     if cfg.get("phase4_reset_classifier", True):
         reset_module_parameters(model.classifier)
         print("Reinitialized Phase 4 classifier.")
@@ -133,6 +106,7 @@ def main():
     print("Phase 4: Cross-Entropy Classifier Retraining")
     print("=" * 80)
 
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters for Phase 4.")
@@ -158,10 +132,20 @@ def main():
         shutil.rmtree(tb_log_dir)
     writer = SummaryWriter(log_dir=tb_log_dir)
     ckpt_saver = AsyncCheckpointSaver(device)
+    cls_metrics = create_classification_metrics(num_classes, device)
 
-    best_val_score = baseline_val_score
-    best_val_f1 = baseline_val_metrics["f1"]
-    best_val_auc = baseline_val_metrics["auc"]
+    score_f1_weight = float(cfg.get("selection_f1_weight", 0.7))
+    score_auc_weight = float(cfg.get("selection_auc_weight", 0.3))
+    weight_sum = score_f1_weight + score_auc_weight
+    if weight_sum <= 0:
+        raise ValueError("selection_f1_weight + selection_auc_weight must be positive.")
+    score_f1_weight /= weight_sum
+    score_auc_weight /= weight_sum
+    early_min_delta = cfg.get("early_stopping_min_delta", 0.0)
+
+    best_val_score = -1.0
+    best_val_f1 = -1.0
+    best_val_auc = -1.0
     best_epoch = 0
     epochs_without_improvement = 0
 
@@ -186,6 +170,7 @@ def main():
             gpu_aug=gpu_aug,
         )
         val_metrics = evaluate(model, loaders["val"], criterion, device, num_classes, cls_metrics=cls_metrics)
+        current_test_metrics = evaluate(model, loaders["test"], criterion, device, num_classes, cls_metrics=cls_metrics)
         scheduler.step()
 
         writer.add_scalar("F1/train", train_f1, epoch)
@@ -194,6 +179,9 @@ def main():
         writer.add_scalar("F1/val", val_metrics["f1"], epoch)
         writer.add_scalar("Acc/val", val_metrics["acc"], epoch)
         writer.add_scalar("AUC/val", val_metrics["auc"], epoch)
+        writer.add_scalar("F1/test", current_test_metrics["f1"], epoch)
+        writer.add_scalar("Acc/test", current_test_metrics["acc"], epoch)
+        writer.add_scalar("AUC/test", current_test_metrics["auc"], epoch)
         writer.add_scalar("LearningRate", current_lr, epoch)
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/val", val_metrics["loss"], epoch)
@@ -221,7 +209,9 @@ def main():
                 f"Val — F1: {val_metrics['f1']:.4f} Acc: {val_metrics['acc']:.4f} "
                 f"AUC: {val_metrics['auc']:.4f} Loss: {val_metrics['loss']:.4f} Score: {val_score:.4f} | "
                 f"Best: {best_val_score:.4f}(F1={best_val_f1:.4f},AUC={best_val_auc:.4f})@ep{best_epoch} "
-                f"NoImpr: {epochs_without_improvement}/{cfg['early_stopping_patience']}"
+                f"NoImpr: {epochs_without_improvement}/{cfg['early_stopping_patience']} "
+                f"Test — F1: {current_test_metrics['f1']:.4f} Acc: {current_test_metrics['acc']:.4f} "
+                f"AUC: {current_test_metrics['auc']:.4f}"
             )
 
         gc.collect()
@@ -231,9 +221,6 @@ def main():
             break
 
     ckpt_saver.wait()
-    if best_epoch == 0:
-        torch.save(baseline_state, PHASE4_BEST_MODEL_PATH)
-        print("Phase 4 did not beat the Phase 3 validation baseline; final checkpoint remains Phase 3 weights.")
     print("\n" + "=" * 80)
     print(f"Phase 4 finished. Loading best classifier from epoch {best_epoch} ...")
     model.load_state_dict(torch.load(PHASE4_BEST_MODEL_PATH, map_location=device))
@@ -242,24 +229,6 @@ def main():
 
     writer.flush()
     history_df, _ = load_history_from_tensorboard(tb_log_dir)
-    if best_epoch == 0 and not history_df.empty:
-        baseline_row = {col: None for col in history_df.columns}
-        baseline_row.update(
-            {
-                "epoch": 0,
-                "lr": None,
-                "train_loss": None,
-                "train_f1": None,
-                "train_acc": None,
-                "train_auc": None,
-                "val_loss": baseline_val_metrics["loss"],
-                "val_f1": baseline_val_metrics["f1"],
-                "val_acc": baseline_val_metrics["acc"],
-                "val_auc": baseline_val_metrics["auc"],
-            }
-        )
-        history_df.loc[len(history_df)] = baseline_row
-        history_df = history_df.sort_values("epoch").reset_index(drop=True)
     history_df.to_csv(PHASE4_HISTORY_CSV_PATH, index=False)
     history_df.to_csv(HISTORY_CSV_PATH, index=False)
 

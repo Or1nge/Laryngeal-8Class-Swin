@@ -30,19 +30,48 @@ python -u 图像识别/glottis_binary/launch_parallel_benchmarks.py --build-spli
 # 复评单个 checkpoint
 python 图像识别/glottis_binary/evaluate_checkpoint.py \
   --checkpoint /home/or1ngelinux/CVProjects/Larynx/laryngeal_multiclass/Results/main/glottis_binary_benchmarks/<run>/<model>/best_model.pth
-
-# 只读生成 source-folder aware 阈值诊断报告，不重新训练
-python 图像识别/glottis_binary/analysis/source_threshold_report.py
 ```
 
 每个模型目录会保存 `config_effective.json`、`history.csv`、`best_model.pth`、`metrics.csv`、`confusion_matrix_test.*`、`roc_pr_test.png`、`predictions_*.csv`、`error_samples_test.csv`、`recommended_threshold.json`、`provenance.json` 和运行命令。
 
-`analysis/source_threshold_report.py` 默认读取当前推荐的 `swin_base` 运行目录，基于已保存的
-`predictions_val.csv`、`predictions_test.csv` 和阈值曲线离线生成三档建议：
-`high_specificity`、`balanced`、`high_recall`。报告会按 source folder 单独列出
-recall、specificity、FN、FP，重点包括 `声带固定`、`喉癌`、`正常`、`室带膨隆`，
-用于判断问题来自阈值取舍、source 定义边界，还是模型本身。该脚本不会修改 checkpoint、
-默认阈值或视频推理默认行为。
+## ROI 裁切鲁棒性实验
+
+`build_roi_cropped_split.py` 用于训练一个更能接受局部声门/声带画面的 gate。它复用现有患者级 split，只把正类限制在当前 8 分类任务的 7 个 VOC 类中；每个 split 里抽取一半正类指向 ROI localizer 生成的裁切副本，另一半保留原图，再抽取同数量非声门图片，形成平衡二分类数据。原始图片只读，裁切图和新 split 默认写到 `Results/<worktree>/glottis_binary_roi_crops/`。
+
+```bash
+python 图像识别/glottis_binary/build_roi_cropped_split.py
+
+python 图像识别/roi_reflection/crop_project_rois.py \
+  --image-root /home/or1ngelinux/CVProjects/Larynx/Laryngeal_Dataset_Processed \
+  --output-root ../../Results/roi_cropped_glottis_gate/glottis_binary_roi_crops/images \
+  --manifest-csv ../../Results/roi_cropped_glottis_gate/glottis_binary_roi_crops/roi_crop_manifest.csv \
+  --include-list ../../Results/roi_cropped_glottis_gate/glottis_binary_roi_crops/roi_crop_input_list.csv \
+  --checkpoint swin256=../../Results/main/roi_reflection/localizer_transformer_20260507_111744/roi_localizer_best.pth \
+  --combo-name swin256 \
+  --threshold 0.55 \
+  --min-crop-width-ratio 0.40 \
+  --min-crop-height-ratio 0.40 \
+  --min-crop-area-ratio 0.25 \
+  --max-crop-area-ratio 0.55 \
+  --batch-size 64 --device auto --postprocess-device auto
+
+python -u 图像识别/glottis_binary/train_benchmarks.py \
+  --split ../../Results/roi_cropped_glottis_gate/glottis_binary_roi_crops/roi_cropped_glottis_split.json \
+  --manifest ../../Results/roi_cropped_glottis_gate/glottis_binary_roi_crops/roi_cropped_glottis_manifest.csv \
+  --output-root ../../Results/roi_cropped_glottis_gate/glottis_binary_benchmarks \
+  --run-name roi_cropped_supcon_swin \
+  --models supcon_swin_base \
+  --batch-size 128 --eval-batch-size 384 \
+  --cache-device cuda
+```
+
+本分支当前实测 checkpoint 为：
+
+```text
+../../Results/roi_cropped_glottis_gate/glottis_binary_benchmarks/roi_cropped_supcon_swin/supcon_swin_base/best_model.pth
+```
+
+它在 ROI-cropped 平衡 test split 上推荐阈值 0.96，Accuracy 0.9784、Specificity 0.9948、Glottis recall 0.9619、AUROC 0.9989。插回 main 视频管线且沿用原阈值 0.94 后，全量 `classified_videos` 为 23/43，旧 gate 同口径为 22/43；但 mean gate frames 从 43.6 降到 33.7，说明该模型更稳但不一定更宽松，暂不建议直接替换默认 gate。
 
 ## 当前推荐
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 from pathlib import Path
 from typing import Any
@@ -65,17 +66,86 @@ def parse_combo(value: str) -> tuple[str, list[tuple[str, float]]]:
     return name.strip(), parsed
 
 
-def discover_project_images(image_root: Path, limit: int | None = None) -> list[Path]:
+def read_include_list(include_list: Path, image_root: Path) -> list[Path]:
+    include_list = include_list.expanduser().resolve()
+    if not include_list.exists():
+        raise FileNotFoundError(f"include list does not exist: {include_list}")
+
+    entries: list[str] = []
+    if include_list.suffix.lower() == ".csv":
+        with include_list.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = set(reader.fieldnames or [])
+            path_field = next(
+                (
+                    name
+                    for name in ("image_path", "input_path", "relative_path", "path")
+                    if name in fieldnames
+                ),
+                None,
+            )
+            if path_field is None:
+                raise ValueError(
+                    f"{include_list} must contain one of image_path/input_path/relative_path/path columns."
+                )
+            entries = [str(row.get(path_field, "")).strip() for row in reader]
+    else:
+        entries = [
+            line.strip()
+            for line in include_list.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+    paths: list[Path] = []
+    missing: list[str] = []
+    for entry in entries:
+        path = Path(entry).expanduser()
+        if not path.is_absolute():
+            path = image_root / path
+        path = path.resolve()
+        if not path.exists():
+            missing.append(entry)
+            continue
+        try:
+            path.relative_to(image_root)
+        except ValueError as exc:
+            raise ValueError(f"Included path is outside --image-root: {path}") from exc
+        paths.append(path)
+
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise FileNotFoundError(f"{len(missing)} included images were not found; first missing: {preview}")
+
+    unique_paths = list(dict.fromkeys(paths))
+    if not unique_paths:
+        raise RuntimeError(f"No usable paths found in include list: {include_list}")
+    return unique_paths
+
+
+def discover_project_images(
+    image_root: Path,
+    limit: int | None = None,
+    include_list: Path | None = None,
+) -> list[Path]:
     if not image_root.exists():
         raise FileNotFoundError(f"image root does not exist: {image_root}")
-    paths = [
-        path
-        for path in image_root.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in IMAGE_EXTENSIONS
-        and not any(token in path.stem.lower() or token in path.parent.name.lower() for token in SKIP_TOKENS)
-    ]
-    paths = sorted(paths)
+    if include_list is not None:
+        paths = [
+            path
+            for path in read_include_list(include_list, image_root)
+            if path.is_file()
+            and path.suffix.lower() in IMAGE_EXTENSIONS
+            and not any(token in path.stem.lower() or token in path.parent.name.lower() for token in SKIP_TOKENS)
+        ]
+    else:
+        paths = [
+            path
+            for path in image_root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in IMAGE_EXTENSIONS
+            and not any(token in path.stem.lower() or token in path.parent.name.lower() for token in SKIP_TOKENS)
+        ]
+        paths = sorted(paths)
     if limit is not None:
         paths = paths[: int(limit)]
     if not paths:
@@ -388,6 +458,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", action="append", required=True, help="name=/path/to/roi_localizer_best.pth")
     parser.add_argument("--combo", action="append", default=None, help="combo_name=checkpoint_name[:weight],checkpoint_name[:weight]")
     parser.add_argument("--combo-name", default=None, help="Which combo to use when more than one --combo is supplied.")
+    parser.add_argument("--include-list", type=Path, default=None, help="Optional CSV/TXT of image_path or relative_path entries to crop.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--device", default="auto")
@@ -443,7 +514,7 @@ def main() -> None:
 
     expand_w = resolve_expand_value(args.expand_w, cfgs, combo, "roi_expand_w", 1.8)
     expand_h = resolve_expand_value(args.expand_h, cfgs, combo, "roi_expand_h", 1.6)
-    paths = discover_project_images(image_root, limit=args.limit)
+    paths = discover_project_images(image_root, limit=args.limit, include_list=args.include_list)
     rows: list[dict[str, Any]] = []
     used_labels = sorted({label for label, _weight in combo})
 

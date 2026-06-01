@@ -1,5 +1,119 @@
 # CHANGELOG
 
+## v6.40 (2026-05-26)
+
+### ROI crop replacement training pilot
+- **训练期 ROI 替换增强**：`shared.py` 支持通过 `LARYNX_ROI_MIX_MANIFEST` 与 `LARYNX_ROI_MIX_PROB` 在训练 loader 中启用 ROI crop 替换；当训练图片存在 `auto_accept` ROI crop 时，每次进入 batch 可按概率用裁切图替代原图，评估 loader 保持原图不随机替换。
+- **ROI 评估视图工具**：新增 `图像识别/tools/build_split_roi_manifests.py`、`build_roi_mix_manifest.py` 和 `evaluate_checkpoint_views.py`，用于从当前 split 生成 ROI 预测 manifest、构建训练替换表，并在训练结束后对 val/test 的原图视图与 ROI/回退视图输出对比指标。
+
+---
+
+## v6.39 (2026-05-26)
+
+### Phase 1 KG 延迟激活与训练数据 KG 更新
+- **KG 延迟进入训练**：当 `knowledge_graph.learnable=true` 且配置了 `knowledge_graph.activate_epoch=30` 时，Phase 1 的 epochs 1-29 使用固定的零 inter-class KG similarity，不更新 KG 参数；从 epoch 30 开始切换到配置中的 learnable KG prior 并更新 KG 参数。
+- **KG 参数更新改用 train split**：KG bilevel 更新的外层步骤不再使用 val split，改为从另一个 train 子迭代器拉取 batch；val 只用于验证 / 监控 / 选 checkpoint。
+- **超参收敛**：`supcon_monitor` 从 `val_loss` 改为 `kg_loss`（KG bilevel 在 train 数据上的 loss），KG 延迟期间不触发 early stopping。
+
+---
+
+## v6.38 (2026-05-26)
+
+### ROI 方图训练增强策略调整
+- **README 同步增强策略**：正式训练不使用翻转或随机平移作为图像增强手段，可保留随机旋转、轻微缩放和轻微颜色扰动。
+- **训练配置调整**：`图像识别/config_phase{1,2,3,4}.json` 与 `图像识别/experiments/dinov3_roi_square224_20260525/config_phase{1,2,3,4}.json` 的随机旋转范围从 `±10°` 扩大为 `±180°`，关闭水平/垂直翻转和平移，保留轻微缩放和颜色扰动，不启用随机裁剪、模糊和锐化；`shared.py` 默认值同步为同一策略。
+
+---
+
+## v6.37 (2026-05-25)
+
+### DINOv3 ROI 方图训练集补入混杂图片
+- **新增 ROI 条件化单图数据生成工具**：`图像识别/tools/build_roi_conditioned_dataset.py` 可从 YOLO-Pose + DINOv3 gate 预测 JSONL 生成 224x224 方图分类数据；训练集默认只保留 ROI 成功图，验证/测试集 ROI 失败时使用去黑边原图回退。
+- **混杂图片训练补样**：本轮训练对 `混杂图片` 训练集改为从处理后的去黑边图中按固定随机种子抽入 `3000` 张，其他训练类别仍只保留 ROI 成功样本；最终训练/验证/测试规模为 `8617 / 1376 / 1348`。
+- **本轮结果**：`Results/dinov3_roi_traincrop_mixed3000_valtestfallback_20260525_114558` 完成四阶段训练并归档到 `Results/runs/20260525_115731_main_00d5b72-dirty_testacc0.8591_testauc0.9784`；最终 test macro-F1 `0.7560`、ACC `0.8591`、AUC `0.9784`，Test VOC Acc `0.9866`。
+
+---
+
+## v6.36 (2026-05-25)
+
+### LDP 更新后刷新 8 类图像 split
+- **重新生成冻结病人级切分**：基于当前 `/home/or1ngelinux/CVProjects/Larynx/Laryngeal_Dataset_Processed` 只读扫描，刷新 `图像识别/dataset_split.json`；启用 8 类总图像数从 `13529` 更新为 `13552`，其中 `混杂图片` 为 `5939` 张。
+- **新 split 规模**：train / val / test 分别为 `10828 / 1376 / 1348` 张图，病人组 overlap 与病人别名 overlap 检查均为空。
+- **保持 8 类协议**：`声带固定` 当前 `662` 张仍作为未配置大文件夹排除，不参与静态单图 8 分类训练。
+
+---
+
+## v6.35 (2026-05-24)
+
+### 视频 ROI 更新为 YOLO-Pose + DINOv3 一体流程
+- **ROI 阶段接入 DINOv3 auxiliary head**：`视频识别/video_inference.py` 的 ROI 模块现在默认使用 v12 YOLO-Pose 三点声门定位模型，并在 YOLO 给出 A/L/R 三点候选后调用 DINOv3 point-region auxiliary checkpoint 补充语义置信度。
+- **前处理与新 ROI 算法对齐**：对质量合格帧，ROI 阶段先裁掉已有黑边，再对裁后图统一加黑边送入 YOLO；有候选框且 YOLO/DINO 分数达到接受阈值才裁剪小 ROI 并拉伸为正方形，无框、空裁剪或分数不足时整帧无效。
+- **0/1 gate 回到 ROI 前**：标准顺序改为质量 gate -> `glottis_binary` 声门/非声门 0/1 gate -> YOLO/DINO ROI -> Swin 8 分类；0/1 gate 默认启用。
+- **Swin 优先只看被接受 ROI 小框**：8 分类疾病模型优先只对 ROI 接受后的小框正方形推理，不做逐帧 ROI 回退。
+- **新增视频级全帧兜底**：如果整个视频没有任何 ROI 接受帧，但存在通过质量 + 0/1 gate 的上游有效帧，则把这些原帧送入 Swin 做一次兜底识别，并记录 `roi_video_fallback_full_frame`。
+- **默认 DINOv3 辅助代码根路径修正**：`--roi-dino-aux-code-root` 默认指向 `/home/or1ngelinux/CVProjects/Larynx/YOLOPoseVocalFold`，与实际一体化 ROI 打分脚本位置一致。
+- **新增 ROI 审计字段**：逐帧和诊断表补充 `roi_yolo_prob`、`roi_dino_aux_score`、`roi_dino_aux_factor` 和 `roi_dino_aux_direct_accept`；`summary.json` 记录 YOLO 和 DINOv3 auxiliary checkpoint 路径。
+- **文档同步**：根 README 与 `视频识别/README.md` 已改为 YOLO-Pose + DINOv3 auxiliary ROI v12 主流程。
+
+---
+
+## v6.34 (2026-05-22)
+
+### 视频 ROI 改用 YOLO-Pose 三点声门模型
+- **替换旧 ROI/reflection gate 主路径**：`视频识别/video_inference.py` 不再调用 BAGLS ROI validity/reflection sidecar 做视频帧过滤；ROI 阶段改为使用 `/home/or1ngelinux/CVProjects/Larynx/YOLOPoseVocalFold/Results/containment_loss/yolo_pose_glottic_three_point_y11m_img960_pose24_containment_l0p05_ldp_pseudo_mixedpenalty_copy/weights/best.pt` 做每帧 ROI 定位。
+- **0/1 gate 先于 ROI**：质量合格帧先经过 `glottis_binary` 声门/非声门 gate，再对通过 0/1 gate 的帧运行 YOLO-Pose ROI。ROI 有足够置信度的矩形框时裁框并拉伸为正方形，没有框时裁掉黑边并把整帧拉伸为正方形，避免把严格 ROI 拒绝直接当作 Non-VOC 判据。
+- **保留 CSV 兼容字段**：`roi_valid_prob` 现在记录 YOLO bbox 置信度，`roi_filter_reason` 记录 `roi_detected` 或回退原因；反光字段保留为空值以兼容既有表头。
+- **文档同步**：根 README 与 `视频识别/README.md` 已更新为质量 gate -> glottis 0/1 gate -> YOLO-Pose ROI 裁剪 -> 8 分类 -> top-fraction 投票聚合。
+
+---
+
+## v6.33 (2026-05-18)
+
+### BAGLS 视频流程合并到 main
+- **main 视频入口改用 BAGLS 标准管线**：`视频识别/video_inference.py` 已从 BAGLS ROI/reflection 分支合并，诊断口径固定为质量 gate -> ROI validity/reflection gate -> `glottis_binary` 声门 gate -> 8 分类疾病模型 -> top-fraction 投票聚合。
+- **补入 ROI/reflection sidecar 模块**：`图像识别/roi_reflection/` 进入 main worktree；已验证的 8 类 ROI-soft checkpoint、ROI localizer 和 reflection gate 已迁入 `Results/main/roi_reflection/`，视频推理默认优先读取 main 结果树。
+- **移除旧多规则诊断作为主口径**：`voc_sum_gt_nonvoc`、`nonvoc_lt_*`、`all_frames` 等历史规则不再用于病人级诊断；相关 Non-VOC/VOC 概率仅保留为逐帧审计字段。
+- **文档同步**：根 README 与 `视频识别/README.md` 已改为 main 当前标准流程，并说明 `--render-video` 诊断叠加输出和默认 checkpoint 回退关系。
+
+---
+
+## v6.32 (2026-05-14)
+
+### Hard-class tuning diagnostics
+- **Phase 3 新增可选 pair-margin loss**：`train_phase3.py` 现在同时支持 `phase3_loss_mode=pair_margin` 和 `direction`；默认配置切到 `pair_margin`，仍然只用 val 混淆选对，并保留 Phase 2 baseline guard，未超过 val composite 时不会替换输入 checkpoint。
+- **新增 hard-class specialist 工具**：加入 `图像识别/tools/train_hard_specialist.py`，可从现有 8 类 checkpoint 初始化 backbone，单独训练任意易混类别子模型，并输出 `summary.json`、三集预测、classification report 和 confusion matrix。
+- **新增采样强度对照配置**：加入 `图像识别/experiments/config_phase2_alpha045.json`，用于验证降低 CE 阶段少数类采样强度是否能缓解囊肿过预测。
+- **当前 split 证据**：`Results/main/hard_specialists/` 下已保存 `Reinke-Edema/Vocal-Cord-Cyst/Vocal-Cord-Polyp` 三分类、`Vocal-Cord-Leukoplakia/Cancer` 二分类和 `Vocal-Cord-Cyst/Vocal-Cord-Polyp` 二分类专门模型；专门模型能改善部分子集，但按 val 选择的全局 rerank 仅把 val macro-F1 从 `0.7981` 提到 `0.7986`，test macro-F1 基本不变。
+
+## v6.31 (2026-05-14)
+
+### Phase 3 验证集混淆触发与解冻策略
+- **Phase 3 改用 val 混淆选对**：Phase 3 现在基于 Phase 2 在 val split 上的定向错判比例选择易混类对，阈值为 `>8%`；选中的无序类对会合并成 focused SupCon 训练类集合，但训练样本仍来自 train split。
+- **定向 prototype-margin 纠偏**：Phase 3 在普通 SupCon 外加入 directed prototype margin；若 val 中 A 类常被预测成 B，则训练时只对 A 类 anchor 施加“靠近 A 中心、远离 B 中心”的定向约束。方向权重按 `min(phase3_direction_weight_max, confusion_rate / phase3_confusion_threshold)` 计算。
+- **Phase 3 也按 val 选 checkpoint**：Phase 3 不再按 train loss 保存最优 checkpoint，而是每轮评估 val composite score，并把 Phase 2 原始 val score 作为 epoch 0 baseline；若定向对比训练没有超过 baseline，就继续沿用 Phase 2 权重传给 Phase 4。
+- **解冻策略调整**：Phase 1 / Phase 2 默认只解冻 `stage3.block[-1]`；Phase 1 冻结 classifier，只训练 backbone + projector；Phase 2 冻结 projector，只训练 backbone + classifier；Phase 3 触发后解冻 `stage2.block[-1]` 与 `stage3.block[-1]`；Phase 4 重置 classifier，并训练 `stage3.block[-1]` 与 classifier，projector 保持冻结。
+- **显式 block 解冻补回 final norm**：`unfreeze_blocks` 模式默认同步训练 Swin final norm，避免显式 block 方案比旧 `unfreeze_last_n_blocks=1` 少训练最后归一化层。
+- **Phase 3 产物更名**：混淆矩阵、混淆方向和错分清单改为 `phase3_val_*`，避免与旧的 train-only 选择口径混淆。
+- **Test 只做最终评价**：Phase 2 / Phase 4 不再每轮评测 test split；训练过程只记录 train/val，test 指标仅在加载 validation-selected best checkpoint 后最终计算。
+- **Phase 4 加入输入 checkpoint baseline guard**：Phase 4 会先评估 Phase 3/Phase 2 输入权重的 val composite；只有重置 classifier 后训练出的 checkpoint 超过该 baseline，才会替换最终权重。
+
+---
+
+## v6.30 (2026-05-13)
+
+### 训练曲线测试集隔离
+- **禁止绘制 test 指标曲线**：Phase 2 / Phase 4 仍会评测并记录 test 指标到 CSV、TensorBoard、最终 metrics 和日志，但不会出现在训练曲线图片中；模型选择继续只看 val composite score。
+
+---
+
+## v6.29 (2026-05-07)
+
+### 视频分类目录重命名与补齐
+- **分类视频目录重命名**：`/mnt/data/LarynxData/videos/ali_larynx_20260505` 已改为 `/mnt/data/LarynxData/videos/classified_videos`，视频推理默认路径同步更新。
+- **压缩包补齐整理**：新增 4 个未标注病人压缩包到 `tbr`，新增 3 个已标注疾病压缩包到 `classified_videos/benign/` 的白斑和息肉目录。
+
+---
+
 ## v6.28 (2026-05-06)
 
 ### 视频白斑反光误判保护
@@ -101,7 +215,7 @@
 ### 视频数据盘迁移与 TBR 批次
 - **视频目录移出 workspace**：`data/videos` 已搬到 `/mnt/data/LarynxData/videos`，避免把 1G+ 视频数据继续放在代码 workspace 下。
 - **新增 TBR 待复核视频批次**：从 12 个压缩包中只抽取视频文件，整理到 `/mnt/data/LarynxData/videos/tbr/<原压缩包名>/`，共 13 个 mp4；txt 等非视频文件未放入 `tbr`。
-- **视频推理默认路径更新**：`tools/video_inference.py` 默认读取 `/mnt/data/LarynxData/videos/ali_larynx_20260505`，并支持 `LARYNX_VIDEO_ROOT` 覆盖。
+- **视频推理默认路径更新**：`tools/video_inference.py` 默认读取 `/mnt/data/LarynxData/videos/classified_videos`，并支持 `LARYNX_VIDEO_ROOT` 覆盖。
 - **支持未标注视频推理**：新增 `--allow-unlabeled`，用于 `tbr` 这类没有真实类别标签的视频；当 `--candidate-labels auto` 且没有已知标签时，会自动以所有 VOC 类作为候选类别，summary 只对已知标签计算准确率。
 
 ---

@@ -1,0 +1,12 @@
+BAGLS dataset notice
+
+The BAGLS dataset is not included in this repository. Downloaded archives,
+extracted images, masks, derived crops, and checkpoints trained from BAGLS
+should remain outside source control unless a separate distribution review is
+completed.
+
+Source: https://www.bagls.org/
+Zenodo record: https://doi.org/10.5281/zenodo.3762320
+Paper: https://doi.org/10.1038/s41597-020-0526-3
+License stated by Zenodo: Creative Commons Attribution Non Commercial Share
+Alike 4.0 International (CC BY-NC-SA 4.0).

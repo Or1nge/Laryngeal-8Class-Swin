@@ -31,6 +31,7 @@
 *.mp4
 *.avi
 *.mov
+*.pdf
 *.zip
 *.tar
 *.tar.gz
@@ -38,6 +39,16 @@
 *.gz
 *.rar
 *.7z
+*.log
+*.out
+*.err
+clinical_data/
+Results/
+Samples/
+Dataset/
+data/
+experiments/
+reports/medical_conference_20260505_current_results/
 __pycache__/
 *.py[cod]
 .venv/

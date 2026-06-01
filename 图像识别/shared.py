@@ -1,5 +1,6 @@
 """Shared utilities for Phase 1 (SupCon) and Phase 2 (CE) training scripts."""
 
+import csv
 import json
 import math
 import os
@@ -83,9 +84,9 @@ PHASE2_BEST_MODEL_PATH = os.path.join(RESULTS_DIR, "phase2_best_model.pth")
 PHASE2_FINAL_METRICS_PATH = os.path.join(RESULTS_DIR, "phase2_final_metrics.json")
 PHASE3_CHECKPOINT_PATH = os.path.join(RESULTS_DIR, "phase3_checkpoint.pth")
 PHASE3_HISTORY_PATH = os.path.join(RESULTS_DIR, "phase3_history.json")
-PHASE3_CONFUSION_MATRIX_PATH = os.path.join(RESULTS_DIR, "phase3_train_confusion_matrix.csv")
-PHASE3_CONFUSION_PAIRS_PATH = os.path.join(RESULTS_DIR, "phase3_train_confusion_pairs.csv")
-PHASE3_MISCLASSIFIED_PATH = os.path.join(RESULTS_DIR, "phase3_train_misclassified_samples.csv")
+PHASE3_CONFUSION_MATRIX_PATH = os.path.join(RESULTS_DIR, "phase3_val_confusion_matrix.csv")
+PHASE3_CONFUSION_PAIRS_PATH = os.path.join(RESULTS_DIR, "phase3_val_confusion_pairs.csv")
+PHASE3_MISCLASSIFIED_PATH = os.path.join(RESULTS_DIR, "phase3_val_misclassified_samples.csv")
 PHASE4_BEST_MODEL_PATH = os.path.join(RESULTS_DIR, "phase4_best_model.pth")
 PHASE4_HISTORY_CSV_PATH = os.path.join(RESULTS_DIR, "phase4_history.csv")
 ONNX_MODEL_PATH = os.path.join(RESULTS_DIR, "best_model.onnx")
@@ -287,6 +288,12 @@ def _sync_config_with_dataset_split(cfg, split_path=DATASET_SPLIT_PATH):
 
 
 def load_config(config_path=None, sync_with_split=True):
+    def _env_float(name, default):
+        value = os.environ.get(name)
+        if value in (None, ""):
+            return default
+        return float(value)
+
     defaults = {
         "seed": 42,
         "image_size": 384,
@@ -313,6 +320,7 @@ def load_config(config_path=None, sync_with_split=True):
         "gpu_augment_enabled": True,
         "unfreeze_last_n_blocks": 4,
         "unfreeze_blocks": None,
+        "train_backbone_norm": True,
         "layer_decay": 0.65,
         "classifier_hidden_dim": 128,
         "crop_black_threshold": 15,
@@ -320,17 +328,19 @@ def load_config(config_path=None, sync_with_split=True):
         "color_jitter_contrast": 0.2,
         "color_jitter_saturation": 0.1,
         "color_jitter_hue": 0.02,
-        "random_resized_crop_scale_min": 0.8,
+        "random_resized_crop_scale_min": 1.0,
         "random_resized_crop_scale_max": 1.0,
-        "random_affine_degrees": 15,
-        "random_affine_translate": [0.1, 0.1],
+        "random_affine_degrees": 180,
+        "random_affine_translate": [0.0, 0.0],
         "random_affine_scale": [0.9, 1.1],
-        "random_horizontal_flip_prob": 0.5,
-        "random_vertical_flip_prob": 0.5,
-        "gaussian_blur_prob": 0.5,
-        "gaussian_blur_sigma_max": 5.0,
-        "random_adjust_sharpness_prob": 0.5,
-        "random_adjust_sharpness_factor": 2.0,
+        "random_horizontal_flip_prob": 0.0,
+        "random_vertical_flip_prob": 0.0,
+        "gaussian_blur_prob": 0.0,
+        "gaussian_blur_sigma_max": 0.0,
+        "random_adjust_sharpness_prob": 0.0,
+        "random_adjust_sharpness_factor": 1.0,
+        "roi_mix_manifest": os.environ.get("LARYNX_ROI_MIX_MANIFEST", ""),
+        "roi_mix_prob": _env_float("LARYNX_ROI_MIX_PROB", 0.0),
         "supcon_enabled": True,
         "supcon_batch_size": 64,
         "supcon_epochs": 50,
@@ -441,10 +451,10 @@ class GPUAugment(nn.Module):
         self.crop_scale_max = cfg.get("random_resized_crop_scale_max", 1.0)
         self.crop_ratio_min = cfg.get("random_resized_crop_ratio_min", 0.9)
         self.crop_ratio_max = cfg.get("random_resized_crop_ratio_max", 1.1)
-        self.hflip_p = cfg.get("random_horizontal_flip_prob", 0.5)
-        self.vflip_p = cfg.get("random_vertical_flip_prob", 0.5)
-        self.affine_degrees = cfg.get("random_affine_degrees", 15)
-        self.affine_translate = tuple(cfg.get("random_affine_translate", [0.1, 0.1]))
+        self.hflip_p = cfg.get("random_horizontal_flip_prob", 0.0)
+        self.vflip_p = cfg.get("random_vertical_flip_prob", 0.0)
+        self.affine_degrees = cfg.get("random_affine_degrees", 180)
+        self.affine_translate = tuple(cfg.get("random_affine_translate", [0.0, 0.0]))
         self.affine_scale = tuple(cfg.get("random_affine_scale", [0.9, 1.1]))
         self.cj_brightness = cfg.get("color_jitter_brightness", 0.2)
         self.cj_contrast = cfg.get("color_jitter_contrast", 0.2)
@@ -1171,7 +1181,13 @@ class HierarchicalImageClassifier(nn.Module):
             for stage_idx, block_idx in selected_blocks:
                 for param in self.backbone.layers[stage_idx].blocks[block_idx].parameters():
                     param.requires_grad = True
+            train_norm = bool(cfg.get("train_backbone_norm", True))
+            if train_norm and hasattr(self.backbone, "norm"):
+                for param in self.backbone.norm.parameters():
+                    param.requires_grad = True
             labels = ", ".join(f"stage{stage_idx}.block{block_idx}" for stage_idx, block_idx in selected_blocks)
+            if train_norm and hasattr(self.backbone, "norm"):
+                labels = f"{labels}, norm"
             print(
                 f"Swin blocks: {total_blocks} total, explicitly trainable: "
                 f"{len(selected_blocks)} ({labels})"
@@ -1260,6 +1276,38 @@ def _pil_to_uint8_chw(img):
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
+def _resolve_existing_path(path):
+    if not path:
+        return ""
+    path = os.fspath(path)
+    if os.path.isabs(path):
+        return path
+    candidates = [
+        os.path.join(BASE_DIR, path),
+        os.path.join(RESULTS_DIR, path),
+        os.path.join(WORKSPACE_DIR, path),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _load_roi_mix_manifest(path):
+    manifest_path = _resolve_existing_path(path)
+    if not manifest_path or not os.path.exists(manifest_path):
+        return {}, manifest_path
+    mapping = {}
+    with open(manifest_path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            source = row.get("image_path") or row.get("original_source") or row.get("source")
+            crop = row.get("roi_image_path") or row.get("crop_path") or row.get("output_path")
+            if source and crop and os.path.exists(source) and os.path.exists(crop):
+                mapping[source] = crop
+    return mapping, manifest_path
+
+
 def preload_image_cache(*dataframes, cfg=None, max_size=400, device=None):
     all_paths = []
     seen_paths = set()
@@ -1292,7 +1340,45 @@ def preload_image_cache(*dataframes, cfg=None, max_size=400, device=None):
         images_tensor = images_tensor.to(memory_format=torch.channels_last)
         total_bytes = images_tensor.nelement() * images_tensor.element_size()
         print(f"  Done — unified cache size ~{total_bytes / 1024**2:.0f} MiB (Channels Last)")
-        return {"path_to_idx": path_to_idx, "images": images_tensor, "ordered_paths": all_paths}
+        cache = {"path_to_idx": path_to_idx, "images": images_tensor, "ordered_paths": all_paths}
+
+        roi_mix_manifest = cfg.get("roi_mix_manifest", "")
+        roi_mix_prob = float(cfg.get("roi_mix_prob", 0.0) or 0.0)
+        if roi_mix_manifest and roi_mix_prob > 0:
+            roi_mapping, resolved_manifest = _load_roi_mix_manifest(roi_mix_manifest)
+            roi_images_tensor = torch.empty((N, C, H, W), dtype=torch.uint8, device=target_device)
+            roi_available = torch.zeros(N, dtype=torch.bool, device=target_device)
+            matched = 0
+            for source_path, roi_path in roi_mapping.items():
+                idx = path_to_idx.get(source_path)
+                if idx is None:
+                    continue
+                try:
+                    img = Image.open(roi_path).convert("RGB")
+                    tensor = _pil_to_uint8_chw(preprocess(img)).to(target_device)
+                    roi_images_tensor[idx] = tensor
+                    roi_available[idx] = True
+                    matched += 1
+                except Exception as exc:
+                    print(f"  ROI mix cache failed: {roi_path}: {exc}")
+            if matched:
+                roi_images_tensor = roi_images_tensor.to(memory_format=torch.channels_last)
+                roi_bytes = roi_images_tensor.nelement() * roi_images_tensor.element_size()
+                cache.update(
+                    {
+                        "roi_images": roi_images_tensor,
+                        "roi_available": roi_available,
+                        "roi_mix_prob": roi_mix_prob,
+                        "roi_mix_manifest": resolved_manifest,
+                    }
+                )
+                print(
+                    f"  ROI mix cache: {matched}/{N} images have auto-accepted crops "
+                    f"(prob={roi_mix_prob:.2f}, size ~{roi_bytes / 1024**2:.0f} MiB)."
+                )
+            else:
+                print(f"  ROI mix manifest had no paths matching this cache: {resolved_manifest}")
+        return cache
     else:
         cache = {}
         print(f"Caching {N} images into memory (max_size={max_size}) ...")
@@ -1317,7 +1403,7 @@ def build_transforms(cfg):
 
 
 class VRAMDataLoader:
-    def __init__(self, df, cache, batch_size, sampler=None, shuffle=False):
+    def __init__(self, df, cache, batch_size, sampler=None, shuffle=False, roi_mix_prob=0.0):
         self.batch_size = batch_size
         self.sampler = sampler
         self.shuffle = shuffle
@@ -1337,6 +1423,14 @@ class VRAMDataLoader:
             self.path_indices = torch.tensor(path_index_list, dtype=torch.long, device=self.device)
         self.labels = torch.tensor(df["label"].values, dtype=torch.long, device=self.device)
         self.is_voc = torch.tensor(df["is_voc"].values, dtype=torch.bool, device=self.device)
+        self.roi_images = cache.get("roi_images")
+        self.roi_available = cache.get("roi_available")
+        self.roi_mix_prob = float(roi_mix_prob or 0.0)
+        self.roi_mix_enabled = (
+            self.roi_mix_prob > 0
+            and self.roi_images is not None
+            and self.roi_available is not None
+        )
         self.num_samples = self.dataset_size
         self.sample_weights = None
         self.replacement = True
@@ -1352,6 +1446,20 @@ class VRAMDataLoader:
         if self._contiguous_start is not None:
             return local_indices + self._contiguous_start
         return self.path_indices[local_indices]
+
+    def _images_for_indices(self, global_idx):
+        images = self.images_tensor[global_idx]
+        if not self.roi_mix_enabled:
+            return images
+        available = self.roi_available[global_idx]
+        if not torch.any(available):
+            return images
+        use_roi = available & (torch.rand(available.shape, device=self.device) < self.roi_mix_prob)
+        if not torch.any(use_roi):
+            return images
+        mixed = images.clone()
+        mixed[use_roi] = self.roi_images[global_idx[use_roi]]
+        return mixed
         
     def __iter__(self):
         if self.sample_weights is not None:
@@ -1378,7 +1486,7 @@ class VRAMDataLoader:
                 image_end = self._contiguous_start + end
                 local_slice = slice(i, end)
                 yield (
-                    self.images_tensor[image_start:image_end],
+                    self._images_for_indices(torch.arange(image_start, image_end, device=self.device)),
                     self.labels[local_slice],
                     self.is_voc[local_slice],
                 )
@@ -1387,7 +1495,7 @@ class VRAMDataLoader:
             batch_idx = indices[i:end]
             global_idx = self._global_indices(batch_idx)
             # CUDA advanced indexing preserves channels_last layout for the image batch.
-            yield self.images_tensor[global_idx], self.labels[batch_idx], self.is_voc[batch_idx]
+            yield self._images_for_indices(global_idx), self.labels[batch_idx], self.is_voc[batch_idx]
 
     def __len__(self):
         return (self.num_samples + self.batch_size - 1) // self.batch_size
@@ -1401,7 +1509,14 @@ def create_loaders(train_df, val_df, test_df, cfg, image_cache=None, train_sampl
     use_shuffle = train_sampler is None
     
     if image_cache is not None and "images" in image_cache:
-        train_loader = VRAMDataLoader(train_df, image_cache, bs, sampler=train_sampler, shuffle=use_shuffle)
+        roi_mix_prob = 0.0
+        if image_cache.get("roi_images") is not None:
+            roi_mix_prob = float(cfg.get("roi_mix_prob", image_cache.get("roi_mix_prob", 0.0)) or 0.0)
+            if roi_mix_prob > 0:
+                print(f"Training ROI replacement enabled: prob={roi_mix_prob:.2f}")
+        train_loader = VRAMDataLoader(
+            train_df, image_cache, bs, sampler=train_sampler, shuffle=use_shuffle, roi_mix_prob=roi_mix_prob
+        )
         train_eval_loader = VRAMDataLoader(train_df, image_cache, ebs, shuffle=False)
         val_loader = VRAMDataLoader(val_df, image_cache, ebs, shuffle=False)
         test_loader = VRAMDataLoader(test_df, image_cache, ebs, shuffle=False)
@@ -1694,16 +1809,16 @@ def supcon_train_one_epoch(model, loader, optimizer, criterion, scaler, device, 
 
 
 def supcon_train_one_epoch_bilevel(
-    model, train_loader, val_iter,
+    model, train_loader, kg_iter,
     model_optimizer, kg_optimizer,
     criterion, scaler, device, grad_accum,
     kg_anchor_strength=0.0,
     gpu_aug=None,
 ):
-    """Bilevel SupCon: model params updated on train data, KG params on val data.
+    """Bilevel SupCon: model params and KG params updated on train data.
 
     First-order approximation: after every model optimizer step (every
-    ``grad_accum`` train mini-batches), fetch one val batch, run a forward
+    ``grad_accum`` train mini-batches), fetch one held-out train batch, run a forward
     pass with *detached* model outputs so gradients only reach KG parameters,
     and perform a single KG optimizer step.
 
@@ -1712,9 +1827,9 @@ def supcon_train_one_epoch_bilevel(
     """
     model.train()
     running_train_loss = torch.tensor(0.0, device=device)
-    running_val_loss = torch.tensor(0.0, device=device)
+    running_kg_loss = torch.tensor(0.0, device=device)
     total_train = 0
-    total_val = 0
+    total_kg = 0
     model_optimizer.zero_grad()
 
     prefetch_loader = maybe_prefetch_loader(train_loader, device)
@@ -1735,37 +1850,37 @@ def supcon_train_one_epoch_bilevel(
             scaler.update()
             model_optimizer.zero_grad()
 
-            # ── Outer step: val batch → update KG φ ──────────────
-            val_batch = next(val_iter)
-            val_images, val_labels = val_batch[0], val_batch[1]
-            if not val_images.is_cuda:
-                val_images = val_images.to(device, non_blocking=True)
-                val_labels = val_labels.to(device, non_blocking=True)
-            val_images = gpu_normalise(val_images)
+            # ── Outer step: train batch → update KG φ ────────────
+            kg_batch = next(kg_iter)
+            kg_images, kg_labels = kg_batch[0], kg_batch[1]
+            if not kg_images.is_cuda:
+                kg_images = kg_images.to(device, non_blocking=True)
+                kg_labels = kg_labels.to(device, non_blocking=True)
+            kg_images = gpu_normalise(kg_images)
 
             kg_optimizer.zero_grad()
             with torch.amp.autocast(device_type=device.type):
                 with torch.no_grad():
-                    val_proj = model(val_images, return_projection=True)
-                val_proj = val_proj.detach().unsqueeze(1)
-                val_loss = criterion(val_proj, val_labels)
+                    kg_proj = model(kg_images, return_projection=True)
+                kg_proj = kg_proj.detach().unsqueeze(1)
+                kg_loss = criterion(kg_proj, kg_labels)
 
             if kg_anchor_strength > 0:
-                val_loss = val_loss + kg_anchor_strength * criterion.anchor_loss()
+                kg_loss = kg_loss + kg_anchor_strength * criterion.anchor_loss()
 
-            val_loss.backward()
+            kg_loss.backward()
             kg_optimizer.step()
 
-            running_val_loss += val_loss.detach() * val_labels.shape[0]
-            total_val += val_labels.shape[0]
+            running_kg_loss += kg_loss.detach() * kg_labels.shape[0]
+            total_kg += kg_labels.shape[0]
 
         running_train_loss += train_loss.detach() * grad_accum * bsz
         total_train += bsz
 
     del prefetch_loader
     avg_train = (running_train_loss / max(total_train, 1)).item()
-    avg_val = (running_val_loss / max(total_val, 1)).item()
-    return avg_train, avg_val
+    avg_kg = (running_kg_loss / max(total_kg, 1)).item()
+    return avg_train, avg_kg
 
 
 def train_one_epoch(

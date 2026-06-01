@@ -221,6 +221,9 @@ def main():
 
     num_classes = len(LABEL_DICT)
     model = HierarchicalImageClassifier(num_classes=num_classes, cfg=cfg).to(device)
+    for param in model.projector.parameters():
+        param.requires_grad = False
+    print("Phase 2 projector frozen; training backbone + classifier only.")
 
     # ── Load Phase 1 checkpoint ──────────────────────────────────────────
     phase1_ckpt = cfg.get("phase1_checkpoint", "")
@@ -288,9 +291,8 @@ def main():
     cls_metrics = create_classification_metrics(num_classes, device)
 
     # ── Training loop ────────────────────────────────────────────────────
-    # NOTE: Test metrics are tracked every epoch purely for diagnostics and
-    # CSV/TensorBoard review. They are NEVER used for model selection — only
-    # the configurable val composite score drives early stopping and
+    # NOTE: Test metrics are evaluated only after loading the validation-selected
+    # checkpoint; the configurable val composite score drives early stopping and
     # checkpoint saving.
     best_val_score = -1.0
     best_val_f1 = -1.0
@@ -320,9 +322,6 @@ def main():
         val_metrics = evaluate(
             compiled_model, loaders["val"], criterion, device, num_classes, cls_metrics=cls_metrics
         )
-        current_test_metrics = evaluate(
-            compiled_model, loaders["test"], criterion, device, num_classes, cls_metrics=cls_metrics
-        )
 
         scheduler.step()
 
@@ -332,9 +331,6 @@ def main():
         writer.add_scalar("F1/val", val_metrics["f1"], epoch)
         writer.add_scalar("Acc/val", val_metrics["acc"], epoch)
         writer.add_scalar("AUC/val", val_metrics["auc"], epoch)
-        writer.add_scalar("F1/test", current_test_metrics["f1"], epoch)
-        writer.add_scalar("Acc/test", current_test_metrics["acc"], epoch)
-        writer.add_scalar("AUC/test", current_test_metrics["auc"], epoch)
         writer.add_scalar("LearningRate", current_lr, epoch)
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/val", val_metrics["loss"], epoch)
@@ -359,16 +355,13 @@ def main():
 
         if epoch % 5 == 0 or epoch == 1:
             star = "*" if improved else " "
-            test_str = (f"  Test — F1: {current_test_metrics['f1']:.4f} "
-                        f"Acc: {current_test_metrics['acc']:.4f} "
-                        f"AUC: {current_test_metrics['auc']:.4f}")
             print(f" {star} Epoch {epoch}/{cfg['epochs']} — LR: {current_lr:.6f} | "
                   f"Train — F1: {train_f1:.4f} Acc: {train_acc:.4f} AUC: {train_auc:.4f} Loss: {train_loss:.4f} | "
                   f"Val — F1: {val_metrics['f1']:.4f} Acc: {val_metrics['acc']:.4f} "
                   f"AUC: {val_metrics['auc']:.4f} Loss: {val_metrics['loss']:.4f} Score: {val_score:.4f} | "
                   f"Best: {best_val_score:.4f}(F1={best_val_f1:.4f},AUC={best_val_auc:.4f})@ep{best_epoch} "
                   f"NoImpr: {epochs_without_improvement}/{cfg['early_stopping_patience']}"
-                  f"{test_str}")
+                  )
 
         gc.collect()
         torch.cuda.empty_cache()

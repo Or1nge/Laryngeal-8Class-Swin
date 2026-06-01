@@ -30,9 +30,19 @@ python -u 图像识别/glottis_binary/launch_parallel_benchmarks.py --build-spli
 # 复评单个 checkpoint
 python 图像识别/glottis_binary/evaluate_checkpoint.py \
   --checkpoint /home/or1ngelinux/CVProjects/Larynx/laryngeal_multiclass/Results/main/glottis_binary_benchmarks/<run>/<model>/best_model.pth
+
+# 只读生成 source-folder aware 阈值诊断报告，不重新训练
+python 图像识别/glottis_binary/analysis/source_threshold_report.py
 ```
 
 每个模型目录会保存 `config_effective.json`、`history.csv`、`best_model.pth`、`metrics.csv`、`confusion_matrix_test.*`、`roc_pr_test.png`、`predictions_*.csv`、`error_samples_test.csv`、`recommended_threshold.json`、`provenance.json` 和运行命令。
+
+`analysis/source_threshold_report.py` 默认读取当前推荐的 `swin_base` 运行目录，基于已保存的
+`predictions_val.csv`、`predictions_test.csv` 和阈值曲线离线生成三档建议：
+`high_specificity`、`balanced`、`high_recall`。报告会按 source folder 单独列出
+recall、specificity、FN、FP，重点包括 `声带固定`、`喉癌`、`正常`、`室带膨隆`，
+用于判断问题来自阈值取舍、source 定义边界，还是模型本身。该脚本不会修改 checkpoint、
+默认阈值或视频推理默认行为。
 
 ## 当前推荐
 

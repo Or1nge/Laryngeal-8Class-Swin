@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## v6.35 (2026-06-02)
+
+### Patient ID parsing
+- **裸 DICOM 文件名识别**：ROI-cropped glottis gate 分支的 binary split 生成逻辑现在把 `13.0000000082503...jpg` 解析为 `00082503`，避免无姓名前缀 LDP 图像被当成逐图独立病人。
+
+---
+
 ## v6.34 (2026-05-18)
 
 ### ROI 裁切声门 Gate 实验分支

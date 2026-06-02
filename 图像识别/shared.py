@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import re
 import threading
 from collections import Counter
 from contextlib import nullcontext
@@ -106,6 +107,7 @@ LOCAL_WEIGHT_CANDIDATES = [
                  "swin_base_patch4_window7_224.ms_in22k_ft_in1k.safetensors"),
 ]
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+DICOM_PATIENT_KEY_PATTERN = re.compile(r"(?:^|_)13\.(\d{13})\.")
 
 
 def resolve_project_path(path):
@@ -910,13 +912,25 @@ class StandardSupConLoss(nn.Module):
         return -mean_log_prob_pos.mean()
 
 
+def extract_dicom_patient_key(stem):
+    match = DICOM_PATIENT_KEY_PATTERN.search(stem)
+    if not match:
+        return None
+    return f"{int(match.group(1)):08d}"[-8:]
+
+
 def get_patient_name(filename):
     basename = os.path.basename(filename)
     if "_" in basename:
-        return basename.split("_")[0]
+        prefix = basename.split("_", 1)[0].strip()
+        if prefix:
+            return prefix
     stem = os.path.splitext(basename)[0]
     if len(stem) >= 8 and stem[:8].isdigit():
         return stem[:8]
+    dicom_patient_key = extract_dicom_patient_key(stem)
+    if dicom_patient_key:
+        return dicom_patient_key
     return stem
 
 

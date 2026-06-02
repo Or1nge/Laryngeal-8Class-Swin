@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+DICOM_PATIENT_KEY_PATTERN = re.compile(r"(?:^|_)13\.(\d{13})\.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,10 +25,15 @@ def parse_args() -> argparse.Namespace:
 def get_patient_name(path: Path) -> str:
     basename = path.name
     if "_" in basename:
-        return basename.split("_", 1)[0]
+        prefix = basename.split("_", 1)[0].strip()
+        if prefix:
+            return prefix
     stem = path.stem
     if len(stem) >= 8 and stem[:8].isdigit():
         return stem[:8]
+    match = DICOM_PATIENT_KEY_PATTERN.search(stem)
+    if match:
+        return f"{int(match.group(1)):08d}"[-8:]
     return stem
 
 

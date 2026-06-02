@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## v6.41 (2026-06-02)
+
+### Patient ID parsing
+- **裸 DICOM 文件名识别**：`shared.py`、glottis binary split 生成和 ROI manifest 工具现在会把 `13.0000000082503...jpg` 这类无姓名前缀的 LDP 文件名解析为 `00082503`，并继续保留带姓名文件的姓名主 ID 与数字别名。
+
+---
+
 ## v6.40 (2026-05-26)
 
 ### ROI crop replacement training pilot

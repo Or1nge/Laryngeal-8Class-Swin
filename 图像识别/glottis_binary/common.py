@@ -58,6 +58,7 @@ from shared import (  # noqa: E402
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+DICOM_PATIENT_KEY_PATTERN = re.compile(r"(?:^|_)13\.(\d{13})\.")
 LABEL_NAMES = {0: "non_glottis", 1: "glottis"}
 DISPLAY_NAMES = {0: "Non-glottis / non-effective vocal fold", 1: "Glottis / effective vocal fold"}
 
@@ -214,8 +215,18 @@ def get_patient_name(path: Path) -> str:
             return prefix
     if len(stem) >= 8 and stem[:8].isdigit():
         return stem[:8]
+    dicom_patient_key = extract_dicom_patient_key(stem)
+    if dicom_patient_key:
+        return dicom_patient_key
     stripped_stem = stem.strip()
     return stripped_stem if stripped_stem else path.name
+
+
+def extract_dicom_patient_key(stem: str) -> str | None:
+    match = DICOM_PATIENT_KEY_PATTERN.search(stem)
+    if not match:
+        return None
+    return f"{int(match.group(1)):08d}"[-8:]
 
 
 def get_patient_aliases(path: Path) -> set[str]:
@@ -226,9 +237,9 @@ def get_patient_aliases(path: Path) -> set[str]:
     if named_ten_digit:
         aliases.add(named_ten_digit.group(1)[:8])
 
-    dicom_like = re.match(r"^.+?_13\.(\d{13})\.", stem)
-    if dicom_like:
-        aliases.add(f"{int(dicom_like.group(1)):08d}"[-8:])
+    dicom_patient_key = extract_dicom_patient_key(stem)
+    if dicom_patient_key:
+        aliases.add(dicom_patient_key)
 
     return {alias for alias in aliases if alias}
 
@@ -459,6 +470,7 @@ def build_binary_split(
         "patient_id_rules": [
             "use prefix before first underscore for named files",
             "use first eight digits for numeric filenames such as 0005481703.jpg",
+            "use the embedded 13.x DICOM-like key for bare DICOM-style filenames",
             "merge filename aliases when a named file exposes a matching numeric patient key",
             "otherwise use the full filename stem",
         ],

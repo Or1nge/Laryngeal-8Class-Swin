@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import random
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -21,6 +22,7 @@ from PIL import Image
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+DICOM_PATIENT_KEY_PATTERN = re.compile(r"(?:^|_)13\.(\d{13})\.")
 DEFAULT_CLASSES = (
     "混杂图片",
     "正常",
@@ -73,6 +75,9 @@ def get_patient_name(path: Path) -> str:
             return prefix
     if len(stem) >= 8 and stem[:8].isdigit():
         return stem[:8]
+    match = DICOM_PATIENT_KEY_PATTERN.search(stem)
+    if match:
+        return f"{int(match.group(1)):08d}"[-8:]
     stripped = stem.strip()
     return stripped if stripped else path.name
 
